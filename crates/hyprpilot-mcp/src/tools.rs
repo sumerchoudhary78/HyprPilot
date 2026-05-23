@@ -50,6 +50,10 @@ pub enum Dispatch {
     Forward(Request),
     /// Return a dry-run preview without touching the daemon.
     Preview(String),
+    /// Fetch a diff for the named snapshot from the daemon and render it
+    /// into a structured dry-run preview for `snapshot_restore`. Lets the
+    /// agent see exactly what would change without applying anything.
+    PreviewSnapshotRestore { name: String },
 }
 
 /// Parameter-parsing or validation failure.
@@ -626,12 +630,14 @@ pub fn dispatch(name: &str, args: Value) -> Result<Dispatch, DispatchError> {
         }
         "snapshot_restore" => {
             let p: SnapshotMutArgs = parse_args(name, args)?;
-            let snap_name = p.name.clone();
-            forward_or_preview(
-                p.dry_run,
-                Request::SnapshotRestore { name: p.name },
-                || format!("would restore snapshot `{snap_name}` (call snapshot_diff first to preview specific actions)"),
-            )
+            Ok(if p.dry_run {
+                // Defer formatting to the server, which needs to call the
+                // daemon to fetch the diff. Generic Preview text is too vague
+                // for a restore — the operation can be dozens of mutations.
+                Dispatch::PreviewSnapshotRestore { name: p.name }
+            } else {
+                Dispatch::Forward(Request::SnapshotRestore { name: p.name })
+            })
         }
         "snapshot_delete" => {
             let p: SnapshotNameArgs = parse_args(name, args)?;
