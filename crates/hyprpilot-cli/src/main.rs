@@ -57,6 +57,23 @@ enum Cmd {
     Undo,
     /// List the daemon's undo stack (requires daemon).
     UndoList,
+    /// Named snapshots of window/workspace state.
+    #[command(subcommand)]
+    Snapshot(SnapshotCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum SnapshotCmd {
+    /// Capture the current state as a named snapshot.
+    Save { name: String },
+    /// List all on-disk snapshots.
+    List,
+    /// Show what restoring a snapshot would change, without applying.
+    Diff { name: String },
+    /// Restore a snapshot. Auto-saves a `_pre-restore-<ts>` snapshot first.
+    Restore { name: String },
+    /// Delete a snapshot.
+    Delete { name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -229,7 +246,37 @@ async fn run(cli: Cli) -> Result<()> {
             let v: serde_json::Value = client.call(Request::UndoList).await?;
             emit_json_or_text(cli.json, &v, &pretty_undo_list(&v))
         }
+        Cmd::Snapshot(s) => run_snapshot_cmd(s, cli.daemon_socket.as_deref(), cli.json).await,
     }
+}
+
+async fn run_snapshot_cmd(
+    s: SnapshotCmd,
+    socket: Option<&std::path::Path>,
+    json: bool,
+) -> Result<()> {
+    let mut client = open_daemon(socket).await?;
+    let (req, label) = match s {
+        SnapshotCmd::Save { name } => (Request::SnapshotSave { name: name.clone() }, name),
+        SnapshotCmd::List => (Request::SnapshotList, "list".to_string()),
+        SnapshotCmd::Diff { name } => (Request::SnapshotDiff { name: name.clone() }, name),
+        SnapshotCmd::Restore { name } => (Request::SnapshotRestore { name: name.clone() }, name),
+        SnapshotCmd::Delete { name } => (Request::SnapshotDelete { name: name.clone() }, name),
+    };
+    let v: serde_json::Value = client.call(req).await?;
+    let text = match &v {
+        serde_json::Value::Array(arr) if arr.iter().all(|x| x.is_string()) => {
+            // snapshot list — render as a plain list
+            arr.iter()
+                .filter_map(|x| x.as_str())
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        _ => pretty(&v),
+    };
+    let _ = label;
+    emit_json_or_text(json, &v, &text)
 }
 
 fn pretty_undo_list(v: &serde_json::Value) -> String {

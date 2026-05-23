@@ -59,6 +59,19 @@ pub enum Request {
 
     Undo,
     UndoList,
+
+    /// Capture live state into a snapshot file under
+    /// `$XDG_STATE_HOME/hyprpilot/snapshots/<name>.json`.
+    SnapshotSave { name: String },
+    /// List names of all on-disk snapshots.
+    SnapshotList,
+    /// Show what a restore would change without applying.
+    SnapshotDiff { name: String },
+    /// Restore a snapshot. Captures an implicit `_pre-restore-<unix_ts>`
+    /// snapshot first so the operation is itself reversible.
+    SnapshotRestore { name: String },
+    /// Delete a snapshot file. Idempotent.
+    SnapshotDelete { name: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +107,9 @@ pub mod codes {
     pub const HYPRLAND_IO: &str = "hyprland_io";
     pub const UNDO_EMPTY: &str = "undo_empty";
     pub const UNDO_FAILED: &str = "undo_failed";
+    pub const SNAPSHOT_NOT_FOUND: &str = "snapshot_not_found";
+    pub const SNAPSHOT_INVALID_NAME: &str = "snapshot_invalid_name";
+    pub const SNAPSHOT_IO: &str = "snapshot_io";
     pub const INTERNAL: &str = "internal";
 }
 

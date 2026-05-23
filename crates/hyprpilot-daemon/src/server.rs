@@ -23,7 +23,9 @@ use hyprpilot_core::{Connection, Error as CoreError};
 use crate::protocol::{
     codes, Request, RequestEnvelope, Response, ResponseEnvelope, UndoListEntry,
 };
-use crate::undo::{apply_inverse, read_proc_cmdline, InverseAction, UndoStack};
+use crate::undo::{
+    apply_inverse, default_persist_path, read_proc_cmdline, InverseAction, LoadOutcome, UndoStack,
+};
 
 const UNDO_CAPACITY: usize = 64;
 
@@ -60,9 +62,28 @@ pub async fn run(socket_path: PathBuf) -> AnyResult<()> {
     let version = hypr.version().await.context("Hyprland version probe")?;
     info!(version = %version.version, "connected to Hyprland");
 
+    let mut undo_stack = UndoStack::with_capacity(UNDO_CAPACITY);
+    let persist_path = default_persist_path();
+    match undo_stack.enable_persistence(persist_path.clone()) {
+        LoadOutcome::Loaded(n) => info!(
+            entries = n,
+            path = %persist_path.display(),
+            "restored persisted undo stack"
+        ),
+        LoadOutcome::Empty => info!(
+            path = %persist_path.display(),
+            "no persisted undo stack; starting fresh"
+        ),
+        LoadOutcome::Corrupt(e) => warn!(
+            error = %e,
+            path = %persist_path.display(),
+            "persisted undo stack was malformed; starting fresh (file will be overwritten)"
+        ),
+    }
+
     let state = State {
         hypr,
-        undo: Arc::new(Mutex::new(UndoStack::with_capacity(UNDO_CAPACITY))),
+        undo: Arc::new(Mutex::new(undo_stack)),
         shutdown: Arc::new(Notify::new()),
     };
 
@@ -210,6 +231,13 @@ async fn handle_request(state: &State, req: Request) -> Response {
         // ---- undo ----------------------------------------------------------
         Request::Undo => undo(state).await,
         Request::UndoList => undo_list(state).await,
+
+        // ---- snapshots -----------------------------------------------------
+        Request::SnapshotSave { name } => snapshot_save(state, name).await,
+        Request::SnapshotList => snapshot_list(),
+        Request::SnapshotDiff { name } => snapshot_diff(state, name).await,
+        Request::SnapshotRestore { name } => snapshot_restore(state, name).await,
+        Request::SnapshotDelete { name } => snapshot_delete(name),
     }
 }
 
@@ -348,6 +376,111 @@ async fn undo_list(state: &State) -> Response {
         })
         .collect();
     Response::ok(entries)
+}
+
+async fn snapshot_save(state: &State, name: String) -> Response {
+    use hyprpilot_core::snapshot::{validate_name, Snapshot};
+    if let Err(e) = validate_name(&name) {
+        return Response::err(codes::SNAPSHOT_INVALID_NAME, e.to_string());
+    }
+    let snap = match Snapshot::capture(&state.hypr, name.clone()).await {
+        Ok(s) => s,
+        Err(e) => return core_error(e),
+    };
+    match snap.save_named() {
+        Ok(path) => Response::ok(serde_json::json!({
+            "name": name,
+            "path": path,
+            "windows": snap.windows.len(),
+            "workspaces": snap.workspaces.len(),
+            "monitors": snap.monitors.len(),
+        })),
+        Err(e) => Response::err(codes::SNAPSHOT_IO, e.to_string()),
+    }
+}
+
+fn snapshot_list() -> Response {
+    use hyprpilot_core::snapshot::list_names;
+    match list_names() {
+        Ok(names) => Response::ok(names),
+        Err(e) => Response::err(codes::SNAPSHOT_IO, e.to_string()),
+    }
+}
+
+async fn snapshot_diff(state: &State, name: String) -> Response {
+    use hyprpilot_core::snapshot::{load_named, Snapshot};
+    let target = match load_named(&name) {
+        Ok(s) => s,
+        Err(e) => return snapshot_load_error(e),
+    };
+    let live = match Snapshot::capture(&state.hypr, "_live_").await {
+        Ok(s) => s,
+        Err(e) => return core_error(e),
+    };
+    let diff = target.diff_against(&live);
+    Response::ok(diff)
+}
+
+async fn snapshot_restore(state: &State, name: String) -> Response {
+    use hyprpilot_core::snapshot::{apply_diff, load_named, Snapshot};
+    let target = match load_named(&name) {
+        Ok(s) => s,
+        Err(e) => return snapshot_load_error(e),
+    };
+    // Auto-save a pre-restore snapshot so the operation is reversible.
+    let pre_name = format!("_pre-restore-{}", now_unix());
+    match Snapshot::capture(&state.hypr, pre_name.clone()).await {
+        Ok(s) => {
+            if let Err(e) = s.save_named() {
+                warn!(error = %e, "failed to save pre-restore snapshot; continuing");
+            }
+        }
+        Err(e) => {
+            return core_error(e);
+        }
+    }
+    let live = match Snapshot::capture(&state.hypr, "_live_").await {
+        Ok(s) => s,
+        Err(e) => return core_error(e),
+    };
+    let diff = target.diff_against(&live);
+    let outcomes = apply_diff(&state.hypr, &diff).await;
+    Response::ok(serde_json::json!({
+        "restored": name,
+        "pre_restore_snapshot": pre_name,
+        "mutations_attempted": diff.mutation_count(),
+        "outcomes": outcomes,
+    }))
+}
+
+fn snapshot_delete(name: String) -> Response {
+    use hyprpilot_core::snapshot::{delete_named, validate_name};
+    if let Err(e) = validate_name(&name) {
+        return Response::err(codes::SNAPSHOT_INVALID_NAME, e.to_string());
+    }
+    match delete_named(&name) {
+        Ok(()) => Response::ok(serde_json::json!({ "deleted": name })),
+        Err(e) => Response::err(codes::SNAPSHOT_IO, e.to_string()),
+    }
+}
+
+fn snapshot_load_error(e: CoreError) -> Response {
+    match &e {
+        CoreError::Protocol(s) if s.contains("does not exist") => {
+            Response::err(codes::SNAPSHOT_NOT_FOUND, e.to_string())
+        }
+        CoreError::Protocol(_) => Response::err(codes::SNAPSHOT_INVALID_NAME, e.to_string()),
+        CoreError::Io(_) => Response::err(codes::SNAPSHOT_IO, e.to_string()),
+        CoreError::Json(_) => Response::err(codes::SNAPSHOT_IO, e.to_string()),
+        _ => core_error(e),
+    }
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn from_core<T: serde::Serialize>(r: Result<T, CoreError>) -> Response {

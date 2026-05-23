@@ -1,13 +1,12 @@
 # HyprPilot
 
 Programmatic control of Hyprland for AI agents and humans. Typed Rust IPC
-client, long-running daemon with undo, CLI, and an MCP server.
+client, long-running daemon with undo and snapshots, CLI, and an MCP server.
 
-> Status: v0.2 in development. v0.1 surface (~15 dispatchers, read-only
-> queries, in-memory undo for kill/move) is shipped. v0.2 adds an MCP
-> (Model Context Protocol) server with capability profiles and dry-run
-> default for mutating tools. Rules engine, input synthesis, and screen
-> capture remain future milestones.
+> Status: v0.3 in development. v0.2 shipped MCP, capability profiles, and
+> dry-run. v0.3 adds named snapshots (capture / list / diff / restore /
+> delete) and persistent undo across daemon restarts. Rules engine, input
+> synthesis, and screen capture remain future milestones.
 
 ## Crates
 
@@ -93,6 +92,36 @@ touch the daemon. Agents must pass `dry_run=false` to actually mutate.
 This is layered on top of capability profiles; both must agree before
 a mutation reaches the daemon.
 
+### Snapshots
+
+Capture a known-good layout and restore to it later. Snapshots are JSON
+files under `$XDG_STATE_HOME/hyprpilot/snapshots/<name>.json`.
+
+```sh
+./target/release/hyprpilot snapshot save before-meeting
+./target/release/hyprpilot snapshot list
+./target/release/hyprpilot snapshot diff before-meeting   # preview restore
+./target/release/hyprpilot snapshot restore before-meeting
+# Auto-saves a `_pre-restore-<unix_ts>` snapshot so the restore itself is
+# reversible.
+./target/release/hyprpilot snapshot delete before-meeting
+```
+
+Restore is best-effort. It matches live windows to snapshot entries by
+address, then PID, then `(initial_class, initial_title)`. For each match,
+it restores **workspace** and **floating** state. Exact geometry,
+fullscreen mode, pin state, focus order, and re-spawn of missing windows
+are documented as v0.4 work. Windows present live but absent from the
+snapshot are left alone; restore is never destructive.
+
+### Persistent undo
+
+The daemon's undo stack is persisted to
+`$XDG_STATE_HOME/hyprpilot/undo.json` on every push/pop. Surviving a
+daemon restart means `hyprpilot undo` still works after the daemon's
+process dies. Malformed files are surfaced at startup; the stack starts
+empty rather than aborting.
+
 ## Design
 
 - The compositor's IPC is the source of truth. We do not cache.
@@ -105,8 +134,10 @@ a mutation reaches the daemon.
 
 ## Milestones
 
-- v0.1 (done): core + daemon + CLI, ~15 dispatchers, undo for kill/move.
-- v0.2 (in progress): MCP server, capability profiles, dry-run.
-- v0.3: snapshot/restore, event-driven rules engine.
-- v0.4: input synthesis (wtype/ydotool/libei).
-- v0.5: screen capture + OCR.
+- v0.1 (done): core + daemon + CLI, ~15 dispatchers, in-memory undo.
+- v0.2 (done): MCP server, capability profiles, dry-run.
+- v0.3 (in progress): snapshots (capture / list / diff / restore / delete),
+  persistent undo across daemon restarts.
+- v0.4: event-driven rules engine, exact geometry / fullscreen in restore.
+- v0.5: input synthesis (wtype / ydotool / libei).
+- v0.6: screen capture + OCR.
