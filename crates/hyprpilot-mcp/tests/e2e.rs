@@ -380,12 +380,166 @@ async fn snapshot_invalid_name_rejected() {
         ))
         .await
         .unwrap();
-    // tool_execution failures are reported as isError content, not JSON-RPC error.
-    let result = resp.result.expect("result");
-    assert!(result["isError"].as_bool().unwrap_or(false));
+    // snapshot_invalid_name is agent-input validation: surfaces as
+    // JSON-RPC InvalidParams, same as MCP-layer arg validation.
+    let error = resp.error.expect("expected JSON-RPC error");
+    assert_eq!(error.code, ErrorCode::InvalidParams.code());
+    assert!(error.message.contains("snapshot_invalid_name"));
 
     daemon.abort();
     let _ = std::fs::remove_file(&socket);
+}
+
+#[tokio::test]
+async fn snapshot_not_found_returns_invalid_params() {
+    if !has_hyprland() {
+        eprintln!("skip: no Hyprland");
+        return;
+    }
+    let socket = temp_socket("not-found");
+    let _ = std::fs::remove_file(&socket);
+    let daemon = start_daemon(socket.clone()).await;
+    let mut server = Server::new(Profile::default_safe(), socket.clone());
+    let resp = server
+        .handle(req(
+            30,
+            "tools/call",
+            json!({"name": "snapshot_diff", "arguments": {"name": "absolutely-does-not-exist"}}),
+        ))
+        .await
+        .unwrap();
+    let error = resp.error.expect("expected JSON-RPC error");
+    assert_eq!(error.code, ErrorCode::InvalidParams.code());
+    assert!(error.message.contains("snapshot_not_found"));
+    daemon.abort();
+    let _ = std::fs::remove_file(&socket);
+}
+
+#[tokio::test]
+async fn snapshot_restore_dry_run_includes_diff_summary() {
+    if !has_hyprland() {
+        eprintln!("skip: no Hyprland");
+        return;
+    }
+    let _env_guard = env_lock().lock().unwrap();
+    let state_dir = std::env::temp_dir().join(format!(
+        "hyprpilot-snapshot-test-{}-restore-dry",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&state_dir);
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::env::set_var("XDG_STATE_HOME", &state_dir);
+
+    let socket = temp_socket("snap-restore-dry");
+    let _ = std::fs::remove_file(&socket);
+    let daemon = start_daemon(socket.clone()).await;
+
+    let mut server = Server::new(Profile::default_safe(), socket.clone());
+
+    let snap_name = format!("e2e-restore-dry-{}", std::process::id());
+    let save_resp = server
+        .handle(req(
+            40,
+            "tools/call",
+            json!({"name": "snapshot_save", "arguments": {"name": &snap_name}}),
+        ))
+        .await
+        .unwrap();
+    assert!(save_resp.error.is_none(), "save error: {:?}", save_resp.error);
+
+    // Dry-run restore against the just-saved snapshot. Since live ==
+    // snapshot, mutation_count should be 0 and the preview should say so.
+    let restore_resp = server
+        .handle(req(
+            41,
+            "tools/call",
+            json!({"name": "snapshot_restore", "arguments": {"name": &snap_name}}),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        restore_resp.error.is_none(),
+        "dry-run restore should not raise a JSON-RPC error: {:?}",
+        restore_resp.error
+    );
+    let result = restore_resp.result.expect("ok");
+    assert_eq!(result["isError"].as_bool().unwrap_or(false), false);
+    let text = result["content"][0]["text"].as_str().expect("text content");
+    assert!(text.starts_with("[dry_run]"), "expected dry_run preview, got: {text}");
+    assert!(
+        text.contains("would restore snapshot"),
+        "preview missing action phrase: {text}"
+    );
+    assert!(text.contains(&snap_name), "preview missing snapshot name: {text}");
+    assert!(
+        text.contains("(no changes"),
+        "self-restore should report no changes, got: {text}"
+    );
+    assert!(
+        text.contains("Pass `dry_run: false` to apply."),
+        "preview missing apply hint: {text}"
+    );
+
+    // Clean up.
+    let del_resp = server
+        .handle(req(
+            42,
+            "tools/call",
+            json!({"name": "snapshot_delete", "arguments": {"name": &snap_name}}),
+        ))
+        .await
+        .unwrap();
+    assert!(del_resp.error.is_none());
+
+    daemon.abort();
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_dir_all(&state_dir);
+    std::env::remove_var("XDG_STATE_HOME");
+}
+
+#[tokio::test]
+async fn snapshot_restore_dry_run_missing_snapshot_returns_invalid_params() {
+    if !has_hyprland() {
+        eprintln!("skip: no Hyprland");
+        return;
+    }
+    let _env_guard = env_lock().lock().unwrap();
+    let state_dir = std::env::temp_dir().join(format!(
+        "hyprpilot-snapshot-test-{}-restore-missing",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&state_dir);
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::env::set_var("XDG_STATE_HOME", &state_dir);
+
+    let socket = temp_socket("snap-restore-missing");
+    let _ = std::fs::remove_file(&socket);
+    let daemon = start_daemon(socket.clone()).await;
+
+    let mut server = Server::new(Profile::default_safe(), socket.clone());
+    let resp = server
+        .handle(req(
+            50,
+            "tools/call",
+            json!({
+                "name": "snapshot_restore",
+                "arguments": {"name": "definitely-not-a-real-snapshot"}
+            }),
+        ))
+        .await
+        .unwrap();
+    let error = resp.error.expect("expected JSON-RPC error");
+    assert_eq!(error.code, ErrorCode::InvalidParams.code());
+    assert!(
+        error.message.contains("snapshot_not_found"),
+        "expected snapshot_not_found in: {}",
+        error.message
+    );
+
+    daemon.abort();
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_dir_all(&state_dir);
+    std::env::remove_var("XDG_STATE_HOME");
 }
 
 #[tokio::test]

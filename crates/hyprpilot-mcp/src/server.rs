@@ -16,6 +16,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, warn};
 
+use hyprpilot_core::snapshot::{RestoreAction, SnapshotDiff};
 use hyprpilot_daemon::client::{ClientError, DaemonClient};
 use hyprpilot_daemon::protocol::Request;
 
@@ -205,7 +206,40 @@ impl Server {
                 )
             }
             Dispatch::Forward(request) => self.forward(id, request).await,
+            Dispatch::PreviewSnapshotRestore { name } => {
+                self.preview_snapshot_restore(id, name).await
+            }
         }
+    }
+
+    /// Dry-run preview for `snapshot_restore`: fetch the diff from the daemon
+    /// and render the action list inline. On any daemon error (notably
+    /// `snapshot_not_found`), propagate via the normal error path so the
+    /// agent sees the same JSON-RPC codes it would for a non-dry-run call.
+    async fn preview_snapshot_restore(&mut self, id: Value, name: String) -> JsonRpcResponse {
+        let value = match self.call_daemon(Request::SnapshotDiff { name: name.clone() }).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.daemon = None;
+                let (code, message) = classify_daemon_error(&e);
+                return tool_error(id, code, message);
+            }
+        };
+        let diff: SnapshotDiff = match serde_json::from_value(value) {
+            Ok(d) => d,
+            Err(e) => {
+                return tool_error(
+                    id,
+                    ErrorCode::ToolExecution,
+                    format!("daemon returned malformed snapshot diff: {e}"),
+                );
+            }
+        };
+        let body = render_restore_preview(&name, &diff);
+        JsonRpcResponse::ok(
+            id,
+            CallToolResult { content: vec![Content::text(body)], is_error: false },
+        )
     }
 
     async fn forward(&mut self, id: Value, request: Request) -> JsonRpcResponse {
@@ -224,14 +258,15 @@ impl Server {
             Err(e) => {
                 // Drop the daemon client so the next call attempts a reconnect.
                 self.daemon = None;
-                tool_error(id, ErrorCode::ToolExecution, e)
+                let (code, message) = classify_daemon_error(&e);
+                tool_error(id, code, message)
             }
         }
     }
 
-    async fn call_daemon(&mut self, request: Request) -> Result<Value, String> {
-        let daemon = self.daemon().await.map_err(|e| e.to_string())?;
-        daemon.call::<Value>(request).await.map_err(|e| e.to_string())
+    async fn call_daemon(&mut self, request: Request) -> Result<Value, ClientError> {
+        let daemon = self.daemon().await?;
+        daemon.call::<Value>(request).await
     }
 
     /// Run the stdio loop until EOF. Reads newline-delimited JSON-RPC from
@@ -291,5 +326,103 @@ fn tool_error(id: Value, code: ErrorCode, message: String) -> JsonRpcResponse {
             CallToolResult { content: vec![Content::text(message)], is_error: true },
         ),
         _ => JsonRpcResponse::err(id, code, message),
+    }
+}
+
+/// Map a daemon-side [`ClientError`] to an MCP error code + message.
+///
+/// Validation-class daemon codes (bad agent input that happened to be caught
+/// at the daemon boundary, not in the MCP arg parser) are surfaced as
+/// JSON-RPC `InvalidParams` so they look the same to the agent as MCP-layer
+/// arg validation. Runtime-class codes (Hyprland rejected the dispatch, undo
+/// stack empty, snapshot I/O, etc.) stay as `ToolExecution` and surface as
+/// `isError` content, since they're not the agent's fault to fix by tweaking
+/// its arguments.
+///
+/// The daemon's structured code is preserved as a `[code]` prefix in the
+/// message so the agent and humans can still see exactly what failed.
+/// Format a `SnapshotDiff` into a human-readable preview body for
+/// `snapshot_restore --dry-run`. Caps the action list at 10 lines; an
+/// agent that wants the full list can still call `snapshot_diff` directly.
+fn render_restore_preview(name: &str, diff: &SnapshotDiff) -> String {
+    let mut moves = 0usize;
+    let mut floats = 0usize;
+    let mut missing = 0usize;
+    let mut extra = 0usize;
+    for a in &diff.actions {
+        match a {
+            RestoreAction::MoveToWorkspace { .. } => moves += 1,
+            RestoreAction::ToggleFloating { .. } => floats += 1,
+            RestoreAction::WindowMissing { .. } => missing += 1,
+            RestoreAction::WindowNotInSnapshot { .. } => extra += 1,
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!("[dry_run] would restore snapshot `{name}`:\n"));
+    out.push_str(&format!(
+        "  {moves} window move{}, {floats} float toggle{}, {missing} missing, \
+         {extra} not in snapshot\n",
+        if moves == 1 { "" } else { "s" },
+        if floats == 1 { "" } else { "s" },
+    ));
+
+    if diff.mutation_count() == 0 {
+        out.push_str("  (no changes — current state already matches the snapshot)\n");
+    } else {
+        let mut shown = 0usize;
+        const LIMIT: usize = 10;
+        let mutating: Vec<&RestoreAction> = diff
+            .actions
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    RestoreAction::MoveToWorkspace { .. } | RestoreAction::ToggleFloating { .. }
+                )
+            })
+            .collect();
+        for a in mutating.iter().take(LIMIT) {
+            match a {
+                RestoreAction::MoveToWorkspace { address, to_workspace, .. } => {
+                    out.push_str(&format!(
+                        "  move address:{address} to workspace {to_workspace}\n"
+                    ));
+                }
+                RestoreAction::ToggleFloating { address, target } => {
+                    out.push_str(&format!(
+                        "  toggle floating address:{address} → {target}\n"
+                    ));
+                }
+                _ => {}
+            }
+            shown += 1;
+        }
+        let total = mutating.len();
+        if total > shown {
+            out.push_str(&format!("  ... and {} more\n", total - shown));
+        }
+    }
+    out.push_str("\nPass `dry_run: false` to apply.");
+    out
+}
+
+fn classify_daemon_error(e: &ClientError) -> (ErrorCode, String) {
+    match e {
+        ClientError::Rpc { code, message } => {
+            // Daemon error codes are defined as string constants in
+            // `hyprpilot_daemon::protocol::codes` — see that module for the
+            // canonical list.
+            let mcp_code = match code.as_str() {
+                "snapshot_invalid_name" | "snapshot_not_found" => ErrorCode::InvalidParams,
+                // undo_empty, undo_failed, hyprland_rejected,
+                // hyprland_unknown_dispatcher, hyprland_io, no_instance,
+                // snapshot_io, parse_error, internal — all runtime / state
+                // problems, not bad input. ToolExecution → isError content.
+                _ => ErrorCode::ToolExecution,
+            };
+            (mcp_code, format!("[{code}] {message}"))
+        }
+        _ => (ErrorCode::ToolExecution, e.to_string()),
     }
 }

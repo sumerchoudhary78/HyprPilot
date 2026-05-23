@@ -59,6 +59,26 @@ async fn cursor_pos_is_readable() {
 }
 
 #[tokio::test]
+async fn initial_class_populated_for_at_least_one_client() {
+    let Some(conn) = try_conn() else {
+        eprintln!("skip: no live Hyprland instance");
+        return;
+    };
+    let clients = conn.clients().await.expect("clients query failed");
+    if clients.is_empty() {
+        eprintln!("warning: no clients to inspect; skipping initial_class check");
+        return;
+    }
+    assert!(
+        clients.iter().any(|c| !c.initial_class.is_empty()),
+        "expected at least one client to have a non-empty initial_class; \
+         this likely means the serde alias for `initialClass` regressed. \
+         Clients seen: {}",
+        clients.len()
+    );
+}
+
+#[tokio::test]
 async fn unknown_dispatcher_is_typed_error() {
     let Some(conn) = try_conn() else {
         eprintln!("skip: no live Hyprland instance");
