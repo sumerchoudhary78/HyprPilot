@@ -27,6 +27,7 @@ pub mod events;
 pub mod ipc;
 pub mod query;
 pub mod selector;
+pub mod snapshot;
 pub mod types;
 
 pub use dispatch::Direction;

@@ -11,7 +11,16 @@ use serde_json::{json, Value};
 use tokio::time::sleep;
 
 use hyprpilot_core::Instance;
+use std::sync::{Mutex, OnceLock};
+
 use hyprpilot_mcp::capability::{Profile, ToolGroup};
+
+/// Tests that mutate `XDG_STATE_HOME` must be serialized — env vars are
+/// process-global. Held only while a test's body is dirtying the env.
+fn env_lock() -> &'static Mutex<()> {
+    static L: OnceLock<Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(()))
+}
 use hyprpilot_mcp::protocol::{ErrorCode, JsonRpcRequest};
 use hyprpilot_mcp::Server;
 
@@ -246,6 +255,134 @@ async fn invalid_args_returns_invalid_params() {
         .unwrap();
     let error = resp.error.expect("expected JSON-RPC error");
     assert_eq!(error.code, ErrorCode::InvalidParams.code());
+
+    daemon.abort();
+    let _ = std::fs::remove_file(&socket);
+}
+
+#[tokio::test]
+async fn snapshot_save_list_diff_delete_round_trip() {
+    if !has_hyprland() {
+        eprintln!("skip: no Hyprland");
+        return;
+    }
+    let _env_guard = env_lock().lock().unwrap();
+    // Isolate snapshot storage so this test doesn't see / touch the user's
+    // real snapshots.
+    let state_dir = std::env::temp_dir().join(format!(
+        "hyprpilot-snapshot-test-{}-rt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&state_dir);
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::env::set_var("XDG_STATE_HOME", &state_dir);
+
+    let socket = temp_socket("snapshot");
+    let _ = std::fs::remove_file(&socket);
+    let daemon = start_daemon(socket.clone()).await;
+
+    let mut server = Server::new(Profile::default_safe(), socket.clone());
+
+    // Save under a unique name.
+    let snap_name = format!("e2e-{}", std::process::id());
+    let save_resp = server
+        .handle(req(
+            10,
+            "tools/call",
+            json!({
+                "name": "snapshot_save",
+                "arguments": { "name": snap_name }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(save_resp.error.is_none(), "save error: {:?}", save_resp.error);
+    let save_text = save_resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+    assert!(save_text.contains(&snap_name));
+
+    // List shows it.
+    let list_resp = server
+        .handle(req(
+            11,
+            "tools/call",
+            json!({"name": "snapshot_list", "arguments": {}}),
+        ))
+        .await
+        .unwrap();
+    let list_text = list_resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+    assert!(
+        list_text.contains(&snap_name),
+        "list missing snapshot: {list_text}"
+    );
+
+    // Diff against itself is a no-op (no mutations).
+    let diff_resp = server
+        .handle(req(
+            12,
+            "tools/call",
+            json!({"name": "snapshot_diff", "arguments": {"name": &snap_name}}),
+        ))
+        .await
+        .unwrap();
+    assert!(diff_resp.error.is_none());
+    let diff_text = diff_resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+    // The JSON in the text should contain an `actions` array; mutation_count
+    // is not in the serialization, but no MoveToWorkspace / ToggleFloating
+    // actions should appear since live == snapshot at this moment.
+    assert!(!diff_text.contains("move_to_workspace"));
+    assert!(!diff_text.contains("toggle_floating"));
+
+    // Delete.
+    let del_resp = server
+        .handle(req(
+            13,
+            "tools/call",
+            json!({"name": "snapshot_delete", "arguments": {"name": &snap_name}}),
+        ))
+        .await
+        .unwrap();
+    assert!(del_resp.error.is_none());
+
+    // List no longer shows it.
+    let list2 = server
+        .handle(req(
+            14,
+            "tools/call",
+            json!({"name": "snapshot_list", "arguments": {}}),
+        ))
+        .await
+        .unwrap();
+    let list2_text = list2.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+    assert!(!list2_text.contains(&snap_name), "delete didn't take effect: {list2_text}");
+
+    daemon.abort();
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_dir_all(&state_dir);
+    std::env::remove_var("XDG_STATE_HOME");
+}
+
+#[tokio::test]
+async fn snapshot_invalid_name_rejected() {
+    if !has_hyprland() {
+        eprintln!("skip: no Hyprland");
+        return;
+    }
+    let socket = temp_socket("snap-bad");
+    let _ = std::fs::remove_file(&socket);
+    let daemon = start_daemon(socket.clone()).await;
+
+    let mut server = Server::new(Profile::default_safe(), socket.clone());
+    let resp = server
+        .handle(req(
+            20,
+            "tools/call",
+            json!({"name": "snapshot_save", "arguments": {"name": "../oops"}}),
+        ))
+        .await
+        .unwrap();
+    // tool_execution failures are reported as isError content, not JSON-RPC error.
+    let result = resp.result.expect("result");
+    assert!(result["isError"].as_bool().unwrap_or(false));
 
     daemon.abort();
     let _ = std::fs::remove_file(&socket);

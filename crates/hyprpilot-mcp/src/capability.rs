@@ -40,6 +40,8 @@ pub enum ToolGroup {
     Process,
     /// Undo and inspect the daemon's undo stack.
     Undo,
+    /// Capture, list, restore, delete named snapshots.
+    Snapshot,
 }
 
 impl ToolGroup {
@@ -51,6 +53,7 @@ impl ToolGroup {
             ToolGroup::Destructive => "destructive",
             ToolGroup::Process => "process",
             ToolGroup::Undo => "undo",
+            ToolGroup::Snapshot => "snapshot",
         }
     }
 }
@@ -67,14 +70,15 @@ pub struct Profile {
 }
 
 impl Profile {
-    /// Built-in safe-by-default profile. Read, window, workspace, undo. No
-    /// destructive, no process spawn.
+    /// Built-in safe-by-default profile. Read, window, workspace, undo,
+    /// snapshot. No destructive, no process spawn.
     pub fn default_safe() -> Self {
         let mut allow = HashSet::new();
         allow.insert(ToolGroup::Read);
         allow.insert(ToolGroup::Window);
         allow.insert(ToolGroup::Workspace);
         allow.insert(ToolGroup::Undo);
+        allow.insert(ToolGroup::Snapshot);
         Self {
             name: "default".into(),
             allow,
@@ -93,6 +97,7 @@ impl Profile {
             ToolGroup::Destructive,
             ToolGroup::Process,
             ToolGroup::Undo,
+            ToolGroup::Snapshot,
         ] {
             allow.insert(g);
         }

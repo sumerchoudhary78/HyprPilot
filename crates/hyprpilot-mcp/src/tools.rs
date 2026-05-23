@@ -193,6 +193,20 @@ pub struct ExecArgs {
     pub dry_run: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SnapshotNameArgs {
+    /// Snapshot name. Allowed chars: `[A-Za-z0-9_.-]+`, must not start with
+    /// `.`, max 128 chars.
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SnapshotMutArgs {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
 // =============================================================================
 // Registry
 // =============================================================================
@@ -407,6 +421,50 @@ pub fn registry() -> Vec<ToolDef> {
              of each reversible entry. The most recent entry has index 0. \
              Read-only.",
         ),
+        // ---- Snapshots (group: snapshot) -------------------------------------
+        def::<SnapshotNameArgs>(
+            "snapshot_save",
+            Snapshot,
+            true,
+            "Capture the current Hyprland state (windows + workspaces + \
+             monitors) as a named snapshot on disk. Use to mark a known-good \
+             layout before experimenting. The snapshot can be restored later \
+             via `snapshot_restore`.",
+        ),
+        def::<NoArgs>(
+            "snapshot_list",
+            Snapshot,
+            false,
+            "List all on-disk snapshot names. Read-only.",
+        ),
+        def::<SnapshotNameArgs>(
+            "snapshot_diff",
+            Snapshot,
+            false,
+            "Show what a `snapshot_restore` of this snapshot would change: \
+             which windows would move, which would toggle floating, which \
+             are missing, and which exist now but weren't in the snapshot. \
+             Read-only. Use this to preview a restore before applying.",
+        ),
+        def::<SnapshotMutArgs>(
+            "snapshot_restore",
+            Snapshot,
+            true,
+            "Restore a named snapshot. Best-effort: matches live windows to \
+             snapshot entries by address, then pid, then (initial_class, \
+             initial_title). For each match, restores workspace and floating \
+             state. Exact geometry, fullscreen mode, focus order, and \
+             re-spawn of missing windows are NOT restored in v0.3. Before \
+             restoring, the current state is auto-saved as \
+             `_pre-restore-<unix_ts>` so this op is itself reversible.",
+        ),
+        def::<SnapshotNameArgs>(
+            "snapshot_delete",
+            Snapshot,
+            true,
+            "Delete a snapshot file from disk. Idempotent. Does not affect \
+             live Hyprland state.",
+        ),
     ]
 }
 
@@ -536,6 +594,30 @@ pub fn dispatch(name: &str, args: Value) -> Result<Dispatch, DispatchError> {
             )
         }
 
+        // ---- snapshots -----------------------------------------------------
+        "snapshot_save" => {
+            let p: SnapshotNameArgs = parse_args(name, args)?;
+            Ok(Dispatch::Forward(Request::SnapshotSave { name: p.name }))
+        }
+        "snapshot_list" => parse_no_args(name, args, Request::SnapshotList),
+        "snapshot_diff" => {
+            let p: SnapshotNameArgs = parse_args(name, args)?;
+            Ok(Dispatch::Forward(Request::SnapshotDiff { name: p.name }))
+        }
+        "snapshot_restore" => {
+            let p: SnapshotMutArgs = parse_args(name, args)?;
+            let snap_name = p.name.clone();
+            forward_or_preview(
+                p.dry_run,
+                Request::SnapshotRestore { name: p.name },
+                || format!("would restore snapshot `{snap_name}` (call snapshot_diff first to preview specific actions)"),
+            )
+        }
+        "snapshot_delete" => {
+            let p: SnapshotNameArgs = parse_args(name, args)?;
+            Ok(Dispatch::Forward(Request::SnapshotDelete { name: p.name }))
+        }
+
         other => Err(DispatchError::UnknownTool(other.to_string())),
     }
 }
@@ -650,7 +732,7 @@ mod tests {
     fn registry_count() {
         // Lock the surface so additions are deliberate. Update this number
         // intentionally when adding/removing tools.
-        assert_eq!(registry().len(), 27);
+        assert_eq!(registry().len(), 32);
     }
 
     #[test]
