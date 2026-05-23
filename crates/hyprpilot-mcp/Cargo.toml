@@ -1,0 +1,32 @@
+[package]
+name = "hyprpilot-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "MCP (Model Context Protocol) server for HyprPilot. Exposes Hyprland control as MCP tools."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "hyprpilot-mcp"
+path = "src/bin/mcp.rs"
+
+[dependencies]
+hyprpilot-core = { workspace = true }
+hyprpilot-daemon = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+schemars = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "io-util"] }

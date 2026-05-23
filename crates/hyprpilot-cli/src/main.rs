@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
@@ -178,55 +178,11 @@ impl FsMode {
 }
 
 fn parse_workspace_ref(s: &str) -> std::result::Result<WorkspaceRef, String> {
-    if let Some(rest) = s.strip_prefix("name:") {
-        return Ok(WorkspaceRef::Name(rest.to_string()));
-    }
-    if let Some(rest) = s.strip_prefix("special:") {
-        return Ok(WorkspaceRef::Special(rest.to_string()));
-    }
-    if s == "special" {
-        return Ok(WorkspaceRef::Special(String::new()));
-    }
-    match s {
-        "empty" => Ok(WorkspaceRef::Empty),
-        "prev" | "previous" => Ok(WorkspaceRef::Previous),
-        "next" => Ok(WorkspaceRef::Next),
-        _ => {
-            if let Some(rest) = s.strip_prefix('+') {
-                return rest
-                    .parse::<i32>()
-                    .map(WorkspaceRef::Relative)
-                    .map_err(|e| format!("invalid relative offset: {e}"));
-            }
-            if s.starts_with('-') {
-                return s
-                    .parse::<i32>()
-                    .map(WorkspaceRef::Relative)
-                    .map_err(|e| format!("invalid relative offset: {e}"));
-            }
-            s.parse::<i32>()
-                .map(WorkspaceRef::Id)
-                .map_err(|e| format!("invalid workspace id: {e}"))
-        }
-    }
+    WorkspaceRef::parse(s)
 }
 
 fn parse_selector(s: &str) -> Result<WindowSelector> {
-    if s == "active" || s == "activewindow" {
-        return Ok(WindowSelector::Active);
-    }
-    let (k, v) = s
-        .split_once(':')
-        .ok_or_else(|| anyhow!("selector `{s}` is missing a prefix; expected one of \
-            address:, pid:, class:, title:, tag:, or the literal `active`"))?;
-    Ok(match k {
-        "address" => WindowSelector::Address(v.to_string()),
-        "pid" => WindowSelector::Pid(v.parse().context("pid is not an integer")?),
-        "class" => WindowSelector::Class(v.to_string()),
-        "title" => WindowSelector::Title(v.to_string()),
-        "tag" => WindowSelector::Tag(v.to_string()),
-        other => bail!("unknown selector prefix `{other}:`"),
-    })
+    WindowSelector::parse(s).map_err(|e| anyhow!(e))
 }
 
 #[tokio::main]
