@@ -412,12 +412,12 @@ pub fn snapshot_path(name: &str) -> Result<PathBuf> {
 /// and weird filenames.
 pub fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() {
-        return Err(Error::Protocol(
+        return Err(Error::Validation(
             "snapshot name must not be empty".to_string(),
         ));
     }
     if name.len() > 128 {
-        return Err(Error::Protocol(
+        return Err(Error::Validation(
             "snapshot name too long (max 128 chars)".to_string(),
         ));
     }
@@ -426,7 +426,7 @@ pub fn validate_name(name: &str) -> Result<()> {
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
         || name.starts_with('.')
     {
-        return Err(Error::Protocol(format!(
+        return Err(Error::Validation(format!(
             "snapshot name `{name}` contains illegal characters; allowed: \
              [A-Za-z0-9_.-], must not start with `.`"
         )));
@@ -462,7 +462,7 @@ impl Snapshot {
 pub fn load_named(name: &str) -> Result<Snapshot> {
     let path = snapshot_path(name)?;
     if !path.exists() {
-        return Err(Error::Protocol(format!("snapshot `{name}` does not exist")));
+        return Err(Error::NotFound(format!("snapshot `{name}`")));
     }
     Snapshot::load(&path)
 }

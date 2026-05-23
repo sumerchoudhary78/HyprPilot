@@ -34,4 +34,12 @@ pub enum Error {
     /// Response was syntactically valid but semantically not what we asked for.
     #[error("unexpected Hyprland response: {0}")]
     Protocol(String),
+
+    /// Client-side input was rejected before reaching Hyprland.
+    #[error("validation error: {0}")]
+    Validation(String),
+
+    /// Lookup (e.g. on-disk snapshot) did not find the requested item.
+    #[error("not found: {0}")]
+    NotFound(String),
 }

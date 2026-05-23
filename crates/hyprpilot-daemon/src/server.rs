@@ -466,12 +466,9 @@ fn snapshot_delete(name: String) -> Response {
 
 fn snapshot_load_error(e: CoreError) -> Response {
     match &e {
-        CoreError::Protocol(s) if s.contains("does not exist") => {
-            Response::err(codes::SNAPSHOT_NOT_FOUND, e.to_string())
-        }
-        CoreError::Protocol(_) => Response::err(codes::SNAPSHOT_INVALID_NAME, e.to_string()),
-        CoreError::Io(_) => Response::err(codes::SNAPSHOT_IO, e.to_string()),
-        CoreError::Json(_) => Response::err(codes::SNAPSHOT_IO, e.to_string()),
+        CoreError::NotFound(_) => Response::err(codes::SNAPSHOT_NOT_FOUND, e.to_string()),
+        CoreError::Validation(_) => Response::err(codes::SNAPSHOT_INVALID_NAME, e.to_string()),
+        CoreError::Io(_) | CoreError::Json(_) => Response::err(codes::SNAPSHOT_IO, e.to_string()),
         _ => core_error(e),
     }
 }
