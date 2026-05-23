@@ -1,0 +1,21 @@
+# Example HyprPilot capability profile.
+#
+# Place this file at $XDG_CONFIG_HOME/hyprpilot/profiles/<name>.toml
+# (typically ~/.config/hyprpilot/profiles/<name>.toml) and select it with
+# `hyprpilot-mcp --profile <name>`.
+
+# Tool groups granted to the agent.
+# Valid groups: read, window, workspace, destructive, process, undo.
+allow = ["read", "window", "workspace", "undo"]
+
+# Tools to allow individually, regardless of group membership.
+# Use sparingly; prefer expanding `allow` over per-tool whitelisting.
+allow_tools = [
+    # "kill_active",
+]
+
+# Tools to deny individually. These override the `allow` groups.
+deny_tools = [
+    # "exec",
+    # "close_window",
+]

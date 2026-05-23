@@ -50,6 +50,33 @@ impl fmt::Display for WindowSelector {
     }
 }
 
+impl WindowSelector {
+    /// Parse a stringy selector of the form `address:0x...`, `pid:1234`,
+    /// `class:<regex>`, `title:<regex>`, `tag:<name>`, or the literal
+    /// `active` (alias `activewindow`).
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        if s == "active" || s == "activewindow" {
+            return Ok(WindowSelector::Active);
+        }
+        let (k, v) = s.split_once(':').ok_or_else(|| {
+            format!(
+                "selector `{s}` is missing a prefix; expected one of \
+                 address:, pid:, class:, title:, tag:, or the literal `active`"
+            )
+        })?;
+        Ok(match k {
+            "address" => WindowSelector::Address(v.to_string()),
+            "pid" => WindowSelector::Pid(
+                v.parse().map_err(|e| format!("pid is not an integer: {e}"))?,
+            ),
+            "class" => WindowSelector::Class(v.to_string()),
+            "title" => WindowSelector::Title(v.to_string()),
+            "tag" => WindowSelector::Tag(v.to_string()),
+            other => return Err(format!("unknown selector prefix `{other}:`")),
+        })
+    }
+}
+
 /// Identifies a workspace for `workspace`, `movetoworkspace`, etc.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
@@ -93,6 +120,45 @@ impl fmt::Display for WorkspaceRef {
     }
 }
 
+impl WorkspaceRef {
+    /// Parse a stringy workspace reference: a positive integer for absolute
+    /// id, `+N`/`-N` for relative offsets, `prev` / `next`, `empty`,
+    /// `name:<n>`, or `special[:<n>]`.
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        if let Some(rest) = s.strip_prefix("name:") {
+            return Ok(WorkspaceRef::Name(rest.to_string()));
+        }
+        if let Some(rest) = s.strip_prefix("special:") {
+            return Ok(WorkspaceRef::Special(rest.to_string()));
+        }
+        if s == "special" {
+            return Ok(WorkspaceRef::Special(String::new()));
+        }
+        match s {
+            "empty" => Ok(WorkspaceRef::Empty),
+            "prev" | "previous" => Ok(WorkspaceRef::Previous),
+            "next" => Ok(WorkspaceRef::Next),
+            _ => {
+                if let Some(rest) = s.strip_prefix('+') {
+                    return rest
+                        .parse::<i32>()
+                        .map(WorkspaceRef::Relative)
+                        .map_err(|e| format!("invalid relative offset: {e}"));
+                }
+                if s.starts_with('-') {
+                    return s
+                        .parse::<i32>()
+                        .map(WorkspaceRef::Relative)
+                        .map_err(|e| format!("invalid relative offset: {e}"));
+                }
+                s.parse::<i32>()
+                    .map(WorkspaceRef::Id)
+                    .map_err(|e| format!("invalid workspace id: {e}"))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +170,43 @@ mod tests {
         assert_eq!(WindowSelector::Pid(1234).encode(), "pid:1234");
         assert_eq!(WindowSelector::Class("kitty".into()).encode(), "class:kitty");
         assert_eq!(WindowSelector::Active.encode(), "activewindow");
+    }
+
+    #[test]
+    fn window_selector_parsing() {
+        assert_eq!(WindowSelector::parse("active").unwrap(), WindowSelector::Active);
+        assert_eq!(
+            WindowSelector::parse("class:kitty").unwrap(),
+            WindowSelector::Class("kitty".into())
+        );
+        assert_eq!(
+            WindowSelector::parse("pid:1234").unwrap(),
+            WindowSelector::Pid(1234)
+        );
+        assert!(WindowSelector::parse("just_a_word").is_err());
+        assert!(WindowSelector::parse("bogus:x").is_err());
+    }
+
+    #[test]
+    fn workspace_ref_parsing() {
+        assert_eq!(WorkspaceRef::parse("2").unwrap(), WorkspaceRef::Id(2));
+        assert_eq!(WorkspaceRef::parse("+1").unwrap(), WorkspaceRef::Relative(1));
+        assert_eq!(WorkspaceRef::parse("-3").unwrap(), WorkspaceRef::Relative(-3));
+        assert_eq!(WorkspaceRef::parse("empty").unwrap(), WorkspaceRef::Empty);
+        assert_eq!(WorkspaceRef::parse("prev").unwrap(), WorkspaceRef::Previous);
+        assert_eq!(
+            WorkspaceRef::parse("name:foo").unwrap(),
+            WorkspaceRef::Name("foo".into())
+        );
+        assert_eq!(
+            WorkspaceRef::parse("special:term").unwrap(),
+            WorkspaceRef::Special("term".into())
+        );
+        assert_eq!(
+            WorkspaceRef::parse("special").unwrap(),
+            WorkspaceRef::Special(String::new())
+        );
+        assert!(WorkspaceRef::parse("notanumber").is_err());
     }
 
     #[test]
