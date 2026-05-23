@@ -42,9 +42,9 @@ pub struct Client {
     pub monitor: i32,
     pub class: String,
     pub title: String,
-    #[serde(default)]
+    #[serde(default, alias = "initialClass")]
     pub initial_class: String,
-    #[serde(default)]
+    #[serde(default, alias = "initialTitle")]
     pub initial_title: String,
     pub pid: i32,
     pub xwayland: bool,
