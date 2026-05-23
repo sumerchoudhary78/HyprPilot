@@ -1,0 +1,23 @@
+[package]
+name = "hyprpilot-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "hyprpilot CLI: typed control over Hyprland from the shell"
+
+[[bin]]
+name = "hyprpilot"
+path = "src/main.rs"
+
+[dependencies]
+hyprpilot-core = { workspace = true }
+hyprpilot-daemon = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
