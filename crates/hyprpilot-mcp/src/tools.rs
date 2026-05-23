@@ -96,6 +96,8 @@ pub struct SelectorArgs {
     /// Window selector. One of: `active`, `address:0x<hex>`, `pid:<int>`,
     /// `class:<regex>`, `title:<regex>`, `tag:<name>`.
     pub selector: String,
+    /// When true (default), do not modify Hyprland; return a preview only.
+    /// Pass `false` to actually apply the change.
     #[serde(default = "default_true")]
     pub dry_run: bool,
 }
@@ -105,6 +107,8 @@ pub struct WorkspaceArgs {
     /// Workspace target. Accepts: `<id>` (e.g. `2`), `+N` / `-N` (relative),
     /// `prev`, `next`, `empty`, `name:<n>`, `special[:<n>]`.
     pub target: String,
+    /// When true (default), do not modify Hyprland; return a preview only.
+    /// Pass `false` to actually apply the change.
     #[serde(default = "default_true")]
     pub dry_run: bool,
 }
@@ -132,6 +136,8 @@ impl DirArg {
 pub struct DirectionArgs {
     /// Direction: `l` (left), `r` (right), `u` (up), `d` (down).
     pub direction: DirArg,
+    /// When true (default), do not modify Hyprland; return a preview only.
+    /// Pass `false` to actually apply the change.
     #[serde(default = "default_true")]
     pub dry_run: bool,
 }
@@ -142,6 +148,8 @@ pub struct ResizeArgs {
     pub dx: i32,
     /// Vertical delta in pixels.
     pub dy: i32,
+    /// When true (default), do not modify Hyprland; return a preview only.
+    /// Pass `false` to actually apply the change.
     #[serde(default = "default_true")]
     pub dry_run: bool,
 }
@@ -165,6 +173,8 @@ impl FsModeArg {
 pub struct FullscreenArgs {
     /// `maximize` respects gaps/bars; `fullscreen` is true exclusive.
     pub mode: FsModeArg,
+    /// When true (default), do not modify Hyprland; return a preview only.
+    /// Pass `false` to actually apply the change.
     #[serde(default = "default_true")]
     pub dry_run: bool,
 }
@@ -173,6 +183,8 @@ pub struct FullscreenArgs {
 pub struct FocusMonitorArgs {
     /// Monitor name (e.g. `eDP-1`) or direction (`l`, `r`, `u`, `d`).
     pub name_or_direction: String,
+    /// When true (default), do not modify Hyprland; return a preview only.
+    /// Pass `false` to actually apply the change.
     #[serde(default = "default_true")]
     pub dry_run: bool,
 }
@@ -181,6 +193,8 @@ pub struct FocusMonitorArgs {
 pub struct MonitorArgs {
     /// Monitor name (e.g. `eDP-1`, `HDMI-A-1`).
     pub monitor: String,
+    /// When true (default), do not modify Hyprland; return a preview only.
+    /// Pass `false` to actually apply the change.
     #[serde(default = "default_true")]
     pub dry_run: bool,
 }
@@ -189,6 +203,8 @@ pub struct MonitorArgs {
 pub struct ExecArgs {
     /// Shell command to spawn. Forked-and-detached by Hyprland.
     pub command: String,
+    /// When true (default), do not modify Hyprland; return a preview only.
+    /// Pass `false` to actually apply the change.
     #[serde(default = "default_true")]
     pub dry_run: bool,
 }
@@ -202,7 +218,11 @@ pub struct SnapshotNameArgs {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SnapshotMutArgs {
+    /// Snapshot name. Allowed chars: `[A-Za-z0-9_.-]+`, must not start with `.`,
+    /// max 128 chars.
     pub name: String,
+    /// When true (default), do not modify Hyprland; return a preview only.
+    /// Pass `false` to actually apply the change.
     #[serde(default = "default_true")]
     pub dry_run: bool,
 }
@@ -775,6 +795,19 @@ mod tests {
             }
             other => panic!("expected Forward(DispatchFocusWindow), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn focus_window_dry_run_schema_has_description() {
+        let reg = registry();
+        let tool = reg
+            .iter()
+            .find(|t| t.name == "focus_window")
+            .expect("focus_window in registry");
+        let desc = tool.schema["properties"]["dry_run"]["description"]
+            .as_str()
+            .expect("dry_run description should be a string");
+        assert!(!desc.is_empty(), "dry_run description should be non-empty");
     }
 
     #[test]
