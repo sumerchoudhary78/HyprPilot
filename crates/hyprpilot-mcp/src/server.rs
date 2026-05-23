@@ -224,14 +224,15 @@ impl Server {
             Err(e) => {
                 // Drop the daemon client so the next call attempts a reconnect.
                 self.daemon = None;
-                tool_error(id, ErrorCode::ToolExecution, e)
+                let (code, message) = classify_daemon_error(&e);
+                tool_error(id, code, message)
             }
         }
     }
 
-    async fn call_daemon(&mut self, request: Request) -> Result<Value, String> {
-        let daemon = self.daemon().await.map_err(|e| e.to_string())?;
-        daemon.call::<Value>(request).await.map_err(|e| e.to_string())
+    async fn call_daemon(&mut self, request: Request) -> Result<Value, ClientError> {
+        let daemon = self.daemon().await?;
+        daemon.call::<Value>(request).await
     }
 
     /// Run the stdio loop until EOF. Reads newline-delimited JSON-RPC from
@@ -291,5 +292,37 @@ fn tool_error(id: Value, code: ErrorCode, message: String) -> JsonRpcResponse {
             CallToolResult { content: vec![Content::text(message)], is_error: true },
         ),
         _ => JsonRpcResponse::err(id, code, message),
+    }
+}
+
+/// Map a daemon-side [`ClientError`] to an MCP error code + message.
+///
+/// Validation-class daemon codes (bad agent input that happened to be caught
+/// at the daemon boundary, not in the MCP arg parser) are surfaced as
+/// JSON-RPC `InvalidParams` so they look the same to the agent as MCP-layer
+/// arg validation. Runtime-class codes (Hyprland rejected the dispatch, undo
+/// stack empty, snapshot I/O, etc.) stay as `ToolExecution` and surface as
+/// `isError` content, since they're not the agent's fault to fix by tweaking
+/// its arguments.
+///
+/// The daemon's structured code is preserved as a `[code]` prefix in the
+/// message so the agent and humans can still see exactly what failed.
+fn classify_daemon_error(e: &ClientError) -> (ErrorCode, String) {
+    match e {
+        ClientError::Rpc { code, message } => {
+            // Daemon error codes are defined as string constants in
+            // `hyprpilot_daemon::protocol::codes` — see that module for the
+            // canonical list.
+            let mcp_code = match code.as_str() {
+                "snapshot_invalid_name" | "snapshot_not_found" => ErrorCode::InvalidParams,
+                // undo_empty, undo_failed, hyprland_rejected,
+                // hyprland_unknown_dispatcher, hyprland_io, no_instance,
+                // snapshot_io, parse_error, internal — all runtime / state
+                // problems, not bad input. ToolExecution → isError content.
+                _ => ErrorCode::ToolExecution,
+            };
+            (mcp_code, format!("[{code}] {message}"))
+        }
+        _ => (ErrorCode::ToolExecution, e.to_string()),
     }
 }

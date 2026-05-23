@@ -380,10 +380,37 @@ async fn snapshot_invalid_name_rejected() {
         ))
         .await
         .unwrap();
-    // tool_execution failures are reported as isError content, not JSON-RPC error.
-    let result = resp.result.expect("result");
-    assert!(result["isError"].as_bool().unwrap_or(false));
+    // snapshot_invalid_name is agent-input validation: surfaces as
+    // JSON-RPC InvalidParams, same as MCP-layer arg validation.
+    let error = resp.error.expect("expected JSON-RPC error");
+    assert_eq!(error.code, ErrorCode::InvalidParams.code());
+    assert!(error.message.contains("snapshot_invalid_name"));
 
+    daemon.abort();
+    let _ = std::fs::remove_file(&socket);
+}
+
+#[tokio::test]
+async fn snapshot_not_found_returns_invalid_params() {
+    if !has_hyprland() {
+        eprintln!("skip: no Hyprland");
+        return;
+    }
+    let socket = temp_socket("not-found");
+    let _ = std::fs::remove_file(&socket);
+    let daemon = start_daemon(socket.clone()).await;
+    let mut server = Server::new(Profile::default_safe(), socket.clone());
+    let resp = server
+        .handle(req(
+            30,
+            "tools/call",
+            json!({"name": "snapshot_diff", "arguments": {"name": "absolutely-does-not-exist"}}),
+        ))
+        .await
+        .unwrap();
+    let error = resp.error.expect("expected JSON-RPC error");
+    assert_eq!(error.code, ErrorCode::InvalidParams.code());
+    assert!(error.message.contains("snapshot_not_found"));
     daemon.abort();
     let _ = std::fs::remove_file(&socket);
 }
