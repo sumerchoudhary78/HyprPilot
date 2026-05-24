@@ -134,6 +134,52 @@ daemon restart means `hyprpilot undo` still works after the daemon's
 process dies. Malformed files are surfaced at startup; the stack starts
 empty rather than aborting.
 
+### Input synthesis (v0.5)
+
+Type text, press key chords, move and click the mouse. Built on
+external tools (`wtype` for keyboard, `ydotool` for mouse) plus
+Hyprland's native `sendshortcut` for per-window key delivery.
+
+**This is the most dangerous tool surface in HyprPilot.** An agent
+that can type can execute arbitrary shell commands in any focused
+terminal. Two independent gates apply before any input call reaches
+the wire:
+
+1. **Daemon env-var.** The daemon refuses every `Input*` request
+   unless started with `HYPRPILOT_DANGEROUS_INPUT_OK=1`:
+   ```sh
+   HYPRPILOT_DANGEROUS_INPUT_OK=1 hyprpilot-daemon &
+   ```
+
+2. **Capability profile.** The `input` group is NOT in the built-in
+   `default` profile. To grant it, either use the built-in
+   `unrestricted` profile or write a custom one — see
+   `docs/profile-with-input.example.toml`:
+   ```sh
+   hyprpilot-mcp --profile unrestricted
+   # or, with a custom profile:
+   hyprpilot-mcp --profile my-input-profile
+   ```
+
+Both gates must align before an agent can synthesize input.
+
+```sh
+# CLI examples (require both gates above)
+hyprpilot input type "hello world"
+hyprpilot input keys ctrl+shift+t
+hyprpilot input shortcut ctrl+t class:firefox
+hyprpilot input mouse-move 100 200 --absolute
+hyprpilot input mouse-click left
+```
+
+`input_shortcut` uses Hyprland's `sendshortcut` dispatcher and is
+strictly safer than `input_keys` — it targets a specific window
+by selector instead of going wherever focus happens to be.
+
+Backends are detected at daemon startup; if `wtype` or `ydotool` is
+missing, the corresponding tools return `input_backend_missing` with
+the missing backend name.
+
 ### Declarative rules
 
 The daemon subscribes to Hyprland's event socket and matches each
@@ -195,5 +241,9 @@ reload.
     in `snapshot_restore`.
   - **rules engine**: daemon-side reactions to socket2 events with TOML
     rule files, first-match semantics, reentrance-guarded execution.
-- v0.5: input synthesis (wtype / ydotool / libei).
+- v0.5 (in progress):
+  - **input synthesis**: typing, key chords, mouse via `wtype`,
+    `ydotool`, and Hyprland's `sendshortcut`. Gated by env var +
+    capability profile.
 - v0.6: screen capture + OCR.
+- v0.7: libei migration (replaces wtype/ydotool with Wayland-native EI).
