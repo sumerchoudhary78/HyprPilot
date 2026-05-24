@@ -154,6 +154,14 @@ pub enum RestoreAction {
         address: String,
         class: String,
     },
+    /// Snapshot recorded a different focused window than live. Applied
+    /// last so it overrides any focus side-effects from earlier actions.
+    /// Only emitted when the snapshot's active window can be matched in
+    /// live state.
+    RestoreActiveFocus {
+        address: String,
+        from_address: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -175,6 +183,7 @@ impl SnapshotDiff {
                         | RestoreAction::RepositionFloating { .. }
                         | RestoreAction::SetFullscreen { .. }
                         | RestoreAction::SetPin { .. }
+                        | RestoreAction::RestoreActiveFocus { .. }
                 )
             })
             .count()
@@ -343,6 +352,20 @@ impl Snapshot {
             }
         }
 
+        // Final action: refocus the snapshot's active window if it exists
+        // in live state and differs from the live focus. Emitted last so
+        // it overrides focus side-effects from any earlier mutation.
+        if let Some(target_active) = self.active_window_address.as_deref() {
+            if live.active_window_address.as_deref() != Some(target_active)
+                && live.windows.iter().any(|w| w.address == target_active)
+            {
+                actions.push(RestoreAction::RestoreActiveFocus {
+                    address: target_active.to_string(),
+                    from_address: live.active_window_address.clone(),
+                });
+            }
+        }
+
         SnapshotDiff { actions }
     }
 }
@@ -434,6 +457,11 @@ pub async fn apply_diff(conn: &Connection, diff: &SnapshotDiff) -> Vec<ApplyOutc
             RestoreAction::SetPin { address, .. } => {
                 let sel = WindowSelector::Address(address.clone());
                 let result = conn.pin_window(&sel).await;
+                outcomes.push(ApplyOutcome::from(action.clone(), result));
+            }
+            RestoreAction::RestoreActiveFocus { address, .. } => {
+                let sel = WindowSelector::Address(address.clone());
+                let result = conn.focus_window(&sel).await;
                 outcomes.push(ApplyOutcome::from(action.clone(), result));
             }
             RestoreAction::WindowMissing { .. } | RestoreAction::WindowNotInSnapshot { .. } => {

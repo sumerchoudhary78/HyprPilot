@@ -354,6 +354,7 @@ fn render_restore_preview(name: &str, diff: &SnapshotDiff) -> String {
     let mut repositions = 0usize;
     let mut fullscreens = 0usize;
     let mut pins = 0usize;
+    let mut refocus = 0usize;
     let mut missing = 0usize;
     let mut extra = 0usize;
     for a in &diff.actions {
@@ -363,6 +364,7 @@ fn render_restore_preview(name: &str, diff: &SnapshotDiff) -> String {
             RestoreAction::RepositionFloating { .. } => repositions += 1,
             RestoreAction::SetFullscreen { .. } => fullscreens += 1,
             RestoreAction::SetPin { .. } => pins += 1,
+            RestoreAction::RestoreActiveFocus { .. } => refocus += 1,
             RestoreAction::WindowMissing { .. } => missing += 1,
             RestoreAction::WindowNotInSnapshot { .. } => extra += 1,
         }
@@ -373,7 +375,8 @@ fn render_restore_preview(name: &str, diff: &SnapshotDiff) -> String {
     out.push_str(&format!(
         "  {moves} workspace move{}, {floats} float toggle{}, \
          {repositions} reposition{}, {fullscreens} fullscreen change{}, \
-         {pins} pin toggle{}, {missing} missing, {extra} not in snapshot\n",
+         {pins} pin toggle{}, {refocus} refocus, \
+         {missing} missing, {extra} not in snapshot\n",
         plural(moves),
         plural(floats),
         plural(repositions),
@@ -397,6 +400,7 @@ fn render_restore_preview(name: &str, diff: &SnapshotDiff) -> String {
                         | RestoreAction::RepositionFloating { .. }
                         | RestoreAction::SetFullscreen { .. }
                         | RestoreAction::SetPin { .. }
+                        | RestoreAction::RestoreActiveFocus { .. }
                 )
             })
             .collect();
@@ -437,6 +441,11 @@ fn render_restore_preview(name: &str, diff: &SnapshotDiff) -> String {
                 RestoreAction::SetPin { address, target } => {
                     out.push_str(&format!(
                         "  pin address:{address} → {target}\n"
+                    ));
+                }
+                RestoreAction::RestoreActiveFocus { address, .. } => {
+                    out.push_str(&format!(
+                        "  refocus address:{address}\n"
                     ));
                 }
                 _ => {}
