@@ -95,6 +95,9 @@ impl InputRunner {
             .ydotool
             .as_ref()
             .ok_or(InputError::BackendMissing("ydotool"))?;
+        if !self.backends.ydotoold_reachable() {
+            return Err(InputError::DaemonNotReachable("ydotoold"));
+        }
         let argv = ydotool_mousemove_argv(x, y, absolute);
         debug!(argv = ?argv, "ydotool mousemove");
         let output = Command::new(ydotool)
@@ -115,6 +118,9 @@ impl InputRunner {
             .ydotool
             .as_ref()
             .ok_or(InputError::BackendMissing("ydotool"))?;
+        if !self.backends.ydotoold_reachable() {
+            return Err(InputError::DaemonNotReachable("ydotoold"));
+        }
         let code = button.ydotool_click_code();
         debug!(button = ?button, code, "ydotool click");
         let output = Command::new(ydotool)
@@ -170,15 +176,34 @@ mod tests {
     use std::path::PathBuf;
 
     fn no_backends() -> BackendAvailability {
-        BackendAvailability { wtype: None, ydotool: None }
+        BackendAvailability {
+            wtype: None,
+            ydotool: None,
+            // Point at a path we know exists so the socket probe
+            // doesn't pre-empt the BackendMissing(ydotool) check the
+            // test below asserts on.
+            ydotoold_socket: PathBuf::from("/bin/true"),
+        }
     }
     fn fake_backends() -> BackendAvailability {
         // Point at /bin/true for wtype / ydotool so the runner can spawn
         // something and check the success path. Real wtype/ydotool need
         // a live Wayland compositor and we won't hit them in unit tests.
+        // /bin/true also stands in for ydotoold's socket: the runner
+        // only checks the path exists, not that it's a real socket.
         BackendAvailability {
             wtype: Some(PathBuf::from("/bin/true")),
             ydotool: Some(PathBuf::from("/bin/true")),
+            ydotoold_socket: PathBuf::from("/bin/true"),
+        }
+    }
+    fn ydotool_present_no_daemon() -> BackendAvailability {
+        BackendAvailability {
+            wtype: Some(PathBuf::from("/bin/true")),
+            ydotool: Some(PathBuf::from("/bin/true")),
+            ydotoold_socket: PathBuf::from(
+                "/tmp/hyprpilot-test-nonexistent-ydotoold-socket-zzz",
+            ),
         }
     }
 
@@ -240,6 +265,23 @@ mod tests {
         let r = InputRunner::with_backends(fake_backends());
         r.mouse_move(50, -50, false).await.unwrap();
         r.mouse_click(MouseButton::Left).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mouse_ops_without_ydotoold_socket_return_daemon_not_reachable() {
+        // Regression for issue #14: ydotool installed but ydotoold not
+        // running used to surface as `input_failed` with empty stderr.
+        // Now we probe the socket first and return a typed error with
+        // an actionable hint.
+        let r = InputRunner::with_backends(ydotool_present_no_daemon());
+        assert!(matches!(
+            r.mouse_move(10, 10, false).await,
+            Err(InputError::DaemonNotReachable("ydotoold"))
+        ));
+        assert!(matches!(
+            r.mouse_click(MouseButton::Left).await,
+            Err(InputError::DaemonNotReachable("ydotoold"))
+        ));
     }
 
     #[test]
