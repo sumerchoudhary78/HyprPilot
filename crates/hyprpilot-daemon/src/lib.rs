@@ -10,6 +10,7 @@
 
 pub mod actions;
 pub mod client;
+pub mod engine;
 pub mod protocol;
 pub mod rules;
 pub mod server;
