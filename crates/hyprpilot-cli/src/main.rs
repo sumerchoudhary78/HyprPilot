@@ -94,7 +94,9 @@ enum InputCmd {
     },
     /// Move the mouse cursor (via ydotool).
     MouseMove {
+        #[arg(allow_hyphen_values = true)]
         x: i32,
+        #[arg(allow_hyphen_values = true)]
         y: i32,
         /// Interpret (x, y) as absolute screen coordinates rather than a
         /// delta from the current cursor position.
@@ -616,6 +618,50 @@ mod tests {
                 assert_eq!(target, WorkspaceRef::Id(2));
             }
             other => panic!("expected Ws Switch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mouse_move_accepts_negative_x() {
+        let cli = Cli::parse_from(["hyprpilot", "input", "mouse-move", "-10", "20"]);
+        match cli.cmd {
+            Cmd::Input(InputCmd::MouseMove { x, y, absolute }) => {
+                assert_eq!((x, y, absolute), (-10, 20, false));
+            }
+            other => panic!("expected Input MouseMove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mouse_move_accepts_negative_y() {
+        let cli = Cli::parse_from(["hyprpilot", "input", "mouse-move", "10", "-20"]);
+        match cli.cmd {
+            Cmd::Input(InputCmd::MouseMove { x, y, absolute }) => {
+                assert_eq!((x, y, absolute), (10, -20, false));
+            }
+            other => panic!("expected Input MouseMove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mouse_move_accepts_both_negative() {
+        let cli = Cli::parse_from(["hyprpilot", "input", "mouse-move", "-10", "-20"]);
+        match cli.cmd {
+            Cmd::Input(InputCmd::MouseMove { x, y, absolute }) => {
+                assert_eq!((x, y, absolute), (-10, -20, false));
+            }
+            other => panic!("expected Input MouseMove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mouse_move_absolute_flag_still_parses_with_negative_coords() {
+        let cli = Cli::parse_from(["hyprpilot", "input", "mouse-move", "--absolute", "-5", "-5"]);
+        match cli.cmd {
+            Cmd::Input(InputCmd::MouseMove { x, y, absolute }) => {
+                assert_eq!((x, y, absolute), (-5, -5, true));
+            }
+            other => panic!("expected Input MouseMove, got {other:?}"),
         }
     }
 }

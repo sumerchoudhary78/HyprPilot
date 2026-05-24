@@ -143,6 +143,11 @@ pub mod codes {
     pub const INPUT_DISABLED: &str = "input_disabled";
     /// Required external backend (wtype, ydotool) is not installed.
     pub const INPUT_BACKEND_MISSING: &str = "input_backend_missing";
+    /// External backend daemon (ydotoold) is installed but not running
+    /// / not reachable on its expected socket. Distinct from
+    /// `input_backend_missing` so callers can show a "start the daemon"
+    /// hint rather than an "install it" hint.
+    pub const INPUT_DAEMON_MISSING: &str = "input_daemon_missing";
     /// Input arguments were invalid (bad combo, bad button name).
     pub const INPUT_INVALID: &str = "input_invalid";
     /// Backend ran but exited non-zero.

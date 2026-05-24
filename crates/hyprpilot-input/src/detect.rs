@@ -14,15 +14,23 @@ pub struct BackendAvailability {
     pub wtype: Option<PathBuf>,
     /// Path to `ydotool` if installed.
     pub ydotool: Option<PathBuf>,
+    /// Filesystem path to `ydotoold`'s Unix socket. Existence is
+    /// re-checked before each ydotool invocation so the runner can fail
+    /// with an actionable hint instead of ydotool's silent exit-2.
+    pub ydotoold_socket: PathBuf,
 }
 
+/// Default location ydotool checks when `$YDOTOOL_SOCKET` is unset.
+pub const DEFAULT_YDOTOOLD_SOCKET: &str = "/tmp/.ydotool_socket";
+
 impl BackendAvailability {
-    /// Probe `$PATH` once. Cheap — two file-system lookups. Run at
-    /// daemon startup and cache.
+    /// Probe `$PATH` once. Cheap — a handful of file-system lookups.
+    /// Run at daemon startup and cache.
     pub fn detect() -> Self {
         Self {
             wtype: which("wtype"),
             ydotool: which("ydotool"),
+            ydotoold_socket: ydotoold_socket_path(),
         }
     }
 
@@ -33,6 +41,21 @@ impl BackendAvailability {
     pub fn has_ydotool(&self) -> bool {
         self.ydotool.is_some()
     }
+
+    /// True if `ydotoold`'s socket appears to exist on disk. Cheap
+    /// `stat` — re-run each call so a user starting ydotoold after the
+    /// daemon doesn't have to restart anything.
+    pub fn ydotoold_reachable(&self) -> bool {
+        self.ydotoold_socket.exists()
+    }
+}
+
+/// Resolve ydotoold's socket path: `$YDOTOOL_SOCKET` if set, else the
+/// upstream default.
+pub fn ydotoold_socket_path() -> PathBuf {
+    std::env::var_os("YDOTOOL_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_YDOTOOLD_SOCKET))
 }
 
 /// `which`-style lookup. Walks `$PATH`, returns the first executable

@@ -338,6 +338,7 @@ fn input_disabled_response() -> Response {
 fn input_error_response(e: InputError) -> Response {
     let code = match &e {
         InputError::BackendMissing(_) => codes::INPUT_BACKEND_MISSING,
+        InputError::DaemonNotReachable(_) => codes::INPUT_DAEMON_MISSING,
         InputError::InvalidCombo(_) | InputError::InvalidButton(_) => codes::INPUT_INVALID,
         InputError::BackendFailed { .. } => codes::INPUT_FAILED,
         InputError::Io(_) => codes::INPUT_FAILED,
