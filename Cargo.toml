@@ -6,6 +6,7 @@ members = [
     "crates/hyprpilot-cli",
     "crates/hyprpilot-mcp",
     "crates/hyprpilot-input",
+    "crates/hyprpilot-vision",
 ]
 
 [workspace.package]
@@ -19,6 +20,7 @@ rust-version = "1.75"
 hyprpilot-core = { path = "crates/hyprpilot-core", version = "0.1.0" }
 hyprpilot-daemon = { path = "crates/hyprpilot-daemon", version = "0.1.0" }
 hyprpilot-input = { path = "crates/hyprpilot-input", version = "0.1.0" }
+hyprpilot-vision = { path = "crates/hyprpilot-vision", version = "0.1.0" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "fs", "sync", "signal", "time", "process"] }
 serde = { version = "1", features = ["derive"] }
