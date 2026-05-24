@@ -1,9 +1,9 @@
 //! Screen capture and OCR for HyprPilot.
 //!
-//! Shell-outs to two well-known Wayland-screen tools:
+//! Shell-outs to two well-known tools:
 //!
 //! - [`GrimCapture`] (capture.rs) wraps `grim` (wlr-screencopy client).
-//! - `TesseractOcr` (ocr.rs, added later) wraps the `tesseract` CLI.
+//! - [`TesseractOcr`] (ocr.rs) wraps the `tesseract` CLI.
 //!
 //! Both detect their binary at construction time via [`BackendAvailability`]
 //! and surface missing dependencies as [`VisionError::BackendMissing`]. The
@@ -18,7 +18,9 @@
 pub mod capture;
 pub mod detect;
 pub mod error;
+pub mod ocr;
 
 pub use capture::{GrimCapture, ImageFormat, Region};
 pub use detect::BackendAvailability;
 pub use error::{Result, VisionError};
+pub use ocr::{Psm, TesseractOcr};

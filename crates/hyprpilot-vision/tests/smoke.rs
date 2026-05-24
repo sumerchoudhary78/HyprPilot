@@ -3,10 +3,14 @@
 //! Skipped when `grim` is not installed or no Wayland display is available,
 //! so cargo test still works on non-Wayland CI hosts.
 
-use hyprpilot_vision::{BackendAvailability, GrimCapture, ImageFormat, Region};
+use hyprpilot_vision::{BackendAvailability, GrimCapture, ImageFormat, Region, TesseractOcr};
 
 fn skippable() -> bool {
     !BackendAvailability::detect().has_grim() || std::env::var_os("WAYLAND_DISPLAY").is_none()
+}
+
+fn ocr_skippable() -> bool {
+    skippable() || !BackendAvailability::detect().has_tesseract()
 }
 
 #[tokio::test]
@@ -54,4 +58,39 @@ async fn detect_returns_grim_when_present() {
     }
     let cap = GrimCapture::detect();
     assert!(cap.is_ok(), "detect failed despite grim on PATH");
+}
+
+#[tokio::test]
+async fn ocr_empty_region_returns_empty_string() {
+    if ocr_skippable() {
+        eprintln!("skip: grim+tesseract+wayland not all present");
+        return;
+    }
+    // A 32x32 region from the top-left is almost certainly blank
+    // (compositor gap / wallpaper). Tesseract should exit 0 with no text.
+    let cap = GrimCapture::detect().expect("detect grim");
+    let png = cap
+        .region(Region { x: 0, y: 0, w: 32, h: 32 }, ImageFormat::Png)
+        .await
+        .expect("capture");
+    let ocr = TesseractOcr::detect().expect("detect tesseract");
+    let text = ocr.extract_text(&png).await.expect("OCR");
+    assert!(
+        text.is_empty() || text.len() < 32,
+        "expected near-empty text on blank region, got: {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn ocr_full_screen_runs_without_error() {
+    if ocr_skippable() {
+        eprintln!("skip: grim+tesseract+wayland not all present");
+        return;
+    }
+    // Full-screen capture + OCR. Doesn't assert specific text (depends on
+    // what's onscreen), only that the pipeline returns without error.
+    let cap = GrimCapture::detect().expect("detect grim");
+    let png = cap.full(None, ImageFormat::Png).await.expect("capture");
+    let ocr = TesseractOcr::detect().expect("detect tesseract");
+    let _text = ocr.extract_text(&png).await.expect("OCR");
 }
