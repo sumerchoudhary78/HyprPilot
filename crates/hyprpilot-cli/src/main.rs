@@ -60,6 +60,19 @@ enum Cmd {
     /// Named snapshots of window/workspace state.
     #[command(subcommand)]
     Snapshot(SnapshotCmd),
+    /// Declarative event-to-action rules.
+    #[command(subcommand)]
+    Rules(RulesCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum RulesCmd {
+    /// Show the rules the daemon would load (re-reads the file each call).
+    List,
+    /// Parse + compile the rules file. Reports the first error if invalid.
+    Validate,
+    /// Print the path the daemon reads rules from.
+    Path,
 }
 
 #[derive(Subcommand, Debug)]
@@ -247,7 +260,23 @@ async fn run(cli: Cli) -> Result<()> {
             emit_json_or_text(cli.json, &v, &pretty_undo_list(&v))
         }
         Cmd::Snapshot(s) => run_snapshot_cmd(s, cli.daemon_socket.as_deref(), cli.json).await,
+        Cmd::Rules(r) => run_rules_cmd(r, cli.daemon_socket.as_deref(), cli.json).await,
     }
+}
+
+async fn run_rules_cmd(
+    r: RulesCmd,
+    socket: Option<&std::path::Path>,
+    json: bool,
+) -> Result<()> {
+    let mut client = open_daemon(socket).await?;
+    let req = match r {
+        RulesCmd::List => Request::RulesList,
+        RulesCmd::Validate => Request::RulesValidate,
+        RulesCmd::Path => Request::RulesPath,
+    };
+    let v: serde_json::Value = client.call(req).await?;
+    emit_json_or_text(json, &v, &pretty(&v))
 }
 
 async fn run_snapshot_cmd(

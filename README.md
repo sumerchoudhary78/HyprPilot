@@ -134,6 +134,46 @@ daemon restart means `hyprpilot undo` still works after the daemon's
 process dies. Malformed files are surfaced at startup; the stack starts
 empty rather than aborting.
 
+### Declarative rules
+
+The daemon subscribes to Hyprland's event socket and matches each
+event against rules declared in
+`$XDG_CONFIG_HOME/hyprpilot/rules.toml`. Each rule pairs an event kind
+with field-equality predicates and a list of actions to fire on match.
+
+```toml
+[[rule]]
+name = "slack to scratchpad"
+on = "openwindow"
+when = { class = "Slack" }
+do = ["move_to_workspace_silent special:scratch"]
+```
+
+Semantics:
+
+- **First match wins.** Rules evaluated top-to-bottom; first whose
+  `on` matches and whose `when` predicates all hold fires.
+- **Equality predicates only** in v0.4 (no regex, ranges, negation).
+- **Reentrance guard.** While the engine is executing actions, incoming
+  events skip rule matching, with a ~100 ms tail after actions finish.
+  Prevents rule → action → echo → rule loops.
+- **Per-action failure isolation.** A failing dispatcher logs a warning
+  and the rule's remaining actions still run.
+
+Inspect and validate via CLI or MCP:
+
+```sh
+hyprpilot rules path        # where the daemon reads from
+hyprpilot rules list        # current on-disk rules
+hyprpilot rules validate    # parse + compile, before restarting
+```
+
+See `docs/rules.example.toml` for the full action grammar reference.
+
+Editing `rules.toml` while the daemon is running has no effect — the
+engine uses the version it loaded at startup. Restart the daemon to
+reload.
+
 ## Design
 
 - The compositor's IPC is the source of truth. We do not cache.
@@ -150,10 +190,10 @@ empty rather than aborting.
 - v0.2 (done): MCP server, capability profiles, dry-run.
 - v0.3 (done): snapshots (capture / list / diff / restore / delete),
   persistent undo across daemon restarts.
-- v0.4 (in progress):
-  - **restore completeness**: geometry, fullscreen, pin, active focus —
-    in restore.
+- v0.4 (done):
+  - **restore completeness**: geometry, fullscreen, pin, active focus
+    in `snapshot_restore`.
   - **rules engine**: daemon-side reactions to socket2 events with TOML
-    rule files (separate PR).
+    rule files, first-match semantics, reentrance-guarded execution.
 - v0.5: input synthesis (wtype / ydotool / libei).
 - v0.6: screen capture + OCR.

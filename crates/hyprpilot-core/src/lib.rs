@@ -32,6 +32,6 @@ pub mod types;
 
 pub use dispatch::Direction;
 pub use error::{Error, Result};
-pub use events::{EventStream, RawEvent};
+pub use events::{Event, EventStream, RawEvent};
 pub use ipc::{Connection, Instance};
 pub use selector::{WindowSelector, WorkspaceRef};

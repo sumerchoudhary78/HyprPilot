@@ -42,6 +42,8 @@ pub enum ToolGroup {
     Undo,
     /// Capture, list, restore, delete named snapshots.
     Snapshot,
+    /// Inspect and validate the daemon's declarative rules config.
+    Rules,
 }
 
 impl ToolGroup {
@@ -54,6 +56,7 @@ impl ToolGroup {
             ToolGroup::Process => "process",
             ToolGroup::Undo => "undo",
             ToolGroup::Snapshot => "snapshot",
+            ToolGroup::Rules => "rules",
         }
     }
 }
@@ -71,7 +74,7 @@ pub struct Profile {
 
 impl Profile {
     /// Built-in safe-by-default profile. Read, window, workspace, undo,
-    /// snapshot. No destructive, no process spawn.
+    /// snapshot, rules. No destructive, no process spawn.
     pub fn default_safe() -> Self {
         let mut allow = HashSet::new();
         allow.insert(ToolGroup::Read);
@@ -79,6 +82,7 @@ impl Profile {
         allow.insert(ToolGroup::Workspace);
         allow.insert(ToolGroup::Undo);
         allow.insert(ToolGroup::Snapshot);
+        allow.insert(ToolGroup::Rules);
         Self {
             name: "default".into(),
             allow,
@@ -98,6 +102,7 @@ impl Profile {
             ToolGroup::Process,
             ToolGroup::Undo,
             ToolGroup::Snapshot,
+            ToolGroup::Rules,
         ] {
             allow.insert(g);
         }

@@ -87,6 +87,34 @@ pub async fn run(socket_path: PathBuf) -> AnyResult<()> {
         shutdown: Arc::new(Notify::new()),
     };
 
+    // Rules engine. Loads $XDG_CONFIG_HOME/hyprpilot/rules.toml if present;
+    // if absent, the engine task still starts but is idle. Config parse
+    // errors at startup are logged and the engine is skipped — the rest of
+    // the daemon continues to run.
+    let engine_task = match crate::rules::load_default() {
+        Ok(Some(rule_cfg)) => {
+            info!(rules = rule_cfg.len(), "loaded rules config");
+            let conn = state.hypr.clone();
+            let shutdown = state.shutdown.clone();
+            Some(tokio::spawn(async move {
+                if let Err(e) = crate::engine::run(conn, rule_cfg, shutdown).await {
+                    error!(error = %e, "rules engine exited with error");
+                }
+            }))
+        }
+        Ok(None) => {
+            info!(
+                path = %crate::rules::default_path().display(),
+                "no rules file; engine disabled"
+            );
+            None
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to load rules config; engine disabled");
+            None
+        }
+    };
+
     let shutdown = state.shutdown.clone();
     let accept_loop = {
         let state = state.clone();
@@ -121,6 +149,17 @@ pub async fn run(socket_path: PathBuf) -> AnyResult<()> {
     tokio::select! {
         _ = accept_loop => {},
         _ = signal_loop => {},
+    }
+
+    // The engine task watches the same shutdown Notify; signal_loop above
+    // either fired it on SIGINT/SIGTERM or it was fired by an RPC Shutdown
+    // request. Wait briefly for the engine to exit cleanly.
+    if let Some(handle) = engine_task {
+        match tokio::time::timeout(std::time::Duration::from_secs(1), handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!(error = %e, "engine task panicked"),
+            Err(_) => warn!("engine task did not exit within 1s; abandoning"),
+        }
     }
 
     let _ = std::fs::remove_file(&socket_path);
@@ -238,6 +277,13 @@ async fn handle_request(state: &State, req: Request) -> Response {
         Request::SnapshotDiff { name } => snapshot_diff(state, name).await,
         Request::SnapshotRestore { name } => snapshot_restore(state, name).await,
         Request::SnapshotDelete { name } => snapshot_delete(name),
+
+        // ---- rules ---------------------------------------------------------
+        Request::RulesList => rules_list(),
+        Request::RulesValidate => rules_validate(),
+        Request::RulesPath => Response::ok(serde_json::json!({
+            "path": crate::rules::default_path(),
+        })),
     }
 }
 
@@ -461,6 +507,51 @@ fn snapshot_delete(name: String) -> Response {
     match delete_named(&name) {
         Ok(()) => Response::ok(serde_json::json!({ "deleted": name })),
         Err(e) => Response::err(codes::SNAPSHOT_IO, e.to_string()),
+    }
+}
+
+fn rules_list() -> Response {
+    match crate::rules::load_default() {
+        Ok(Some(cfg)) => Response::ok(serde_json::json!({
+            "path": crate::rules::default_path(),
+            "count": cfg.len(),
+            "rules": cfg.rules,
+        })),
+        Ok(None) => Response::ok(serde_json::json!({
+            "path": crate::rules::default_path(),
+            "count": 0,
+            "rules": [],
+        })),
+        Err(e) => Response::err(codes::RULES_LOAD_FAILED, e.to_string()),
+    }
+}
+
+fn rules_validate() -> Response {
+    let path = crate::rules::default_path();
+    let cfg = match crate::rules::load_default() {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return Response::ok(serde_json::json!({
+                "ok": true,
+                "path": path,
+                "rules": 0,
+                "note": "no rules file present",
+            }));
+        }
+        Err(e) => {
+            return Response::err(codes::RULES_LOAD_FAILED, e.to_string());
+        }
+    };
+    match crate::engine::compile(&cfg) {
+        Ok(compiled) => Response::ok(serde_json::json!({
+            "ok": true,
+            "path": path,
+            "rules": compiled.len(),
+        })),
+        Err(msg) => Response::err(
+            codes::RULES_LOAD_FAILED,
+            format!("rules compile error: {msg}"),
+        ),
     }
 }
 

@@ -72,6 +72,17 @@ pub enum Request {
     SnapshotRestore { name: String },
     /// Delete a snapshot file. Idempotent.
     SnapshotDelete { name: String },
+
+    /// List currently loaded rules (re-reads the file on each call).
+    /// Returns the deserialized RuleConfig as JSON. Parse errors are
+    /// surfaced as `rules_load_failed`.
+    RulesList,
+    /// Validate the rules file: parses TOML, then compiles every rule's
+    /// action list. Returns either `{ ok: true, rules: N }` or details
+    /// of the first parse / compile error.
+    RulesValidate,
+    /// Returns the on-disk path the daemon would load from.
+    RulesPath,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +121,7 @@ pub mod codes {
     pub const SNAPSHOT_NOT_FOUND: &str = "snapshot_not_found";
     pub const SNAPSHOT_INVALID_NAME: &str = "snapshot_invalid_name";
     pub const SNAPSHOT_IO: &str = "snapshot_io";
+    pub const RULES_LOAD_FAILED: &str = "rules_load_failed";
     pub const INTERNAL: &str = "internal";
 }
 

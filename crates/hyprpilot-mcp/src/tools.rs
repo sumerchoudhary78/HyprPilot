@@ -489,6 +489,35 @@ pub fn registry() -> Vec<ToolDef> {
             "Delete a snapshot file from disk. Idempotent. Does not affect \
              live Hyprland state.",
         ),
+        // ---- Rules (group: rules) -------------------------------------------
+        def::<NoArgs>(
+            "rules_list",
+            Rules,
+            false,
+            "List the rules from the daemon's configured rules.toml. \
+             Returns the rules array as declared in the file. The daemon \
+             reads the file fresh on each call, so this reflects current \
+             on-disk state; if you edit rules.toml after the daemon \
+             started, the engine still uses the version it loaded at \
+             startup — restart the daemon to reload. Read-only.",
+        ),
+        def::<NoArgs>(
+            "rules_validate",
+            Rules,
+            false,
+            "Parse and compile the rules.toml file. Returns \
+             `{ ok: true, rules: N }` on success, or a structured error \
+             with the offending rule label and action index. Use this to \
+             check a config change before restarting the daemon. Read-only.",
+        ),
+        def::<NoArgs>(
+            "rules_path",
+            Rules,
+            false,
+            "Return the on-disk path the daemon reads rules from. \
+             Useful for opening the file in an editor without guessing \
+             the XDG resolution. Read-only.",
+        ),
     ]
 }
 
@@ -644,6 +673,11 @@ pub fn dispatch(name: &str, args: Value) -> Result<Dispatch, DispatchError> {
             Ok(Dispatch::Forward(Request::SnapshotDelete { name: p.name }))
         }
 
+        // ---- rules ---------------------------------------------------------
+        "rules_list" => parse_no_args(name, args, Request::RulesList),
+        "rules_validate" => parse_no_args(name, args, Request::RulesValidate),
+        "rules_path" => parse_no_args(name, args, Request::RulesPath),
+
         other => Err(DispatchError::UnknownTool(other.to_string())),
     }
 }
@@ -758,7 +792,7 @@ mod tests {
     fn registry_count() {
         // Lock the surface so additions are deliberate. Update this number
         // intentionally when adding/removing tools.
-        assert_eq!(registry().len(), 32);
+        assert_eq!(registry().len(), 35);
     }
 
     #[test]
