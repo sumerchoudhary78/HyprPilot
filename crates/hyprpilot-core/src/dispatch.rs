@@ -126,4 +126,73 @@ impl Connection {
     pub async fn swap_active(&self, dir: Direction) -> Result<()> {
         self.dispatch(&format!("swapwindow {}", dir.as_letter())).await
     }
+
+    // ---- Selector-targeting variants ----------------------------------------
+    //
+    // These target a specific window by selector rather than the focused one.
+    // Used by snapshot restore (and any caller that needs deterministic
+    // targeting without disturbing the active window).
+    //
+    // Hyprland's dispatcher grammar puts the selector after the args,
+    // comma-separated, e.g. `movewindowpixel exact 100 200,address:0x...`.
+
+    /// Move a floating window to an exact (x, y) screen-space position.
+    /// Hyprland silently no-ops this on tiled windows.
+    pub async fn move_window_pixel(&self, sel: &WindowSelector, x: i32, y: i32) -> Result<()> {
+        self.dispatch(&format!(
+            "movewindowpixel exact {x} {y},{}",
+            sel.encode()
+        ))
+        .await
+    }
+
+    /// Resize a floating window to an exact (width, height) in pixels.
+    pub async fn resize_window_pixel(
+        &self,
+        sel: &WindowSelector,
+        width: i32,
+        height: i32,
+    ) -> Result<()> {
+        self.dispatch(&format!(
+            "resizewindowpixel exact {width} {height},{}",
+            sel.encode()
+        ))
+        .await
+    }
+
+    /// Toggle pin (sticky-across-workspaces) for a specific window. Hyprland
+    /// only allows pinning floating windows; tiled windows return a typed
+    /// rejection. The caller should ensure the window is floating first if
+    /// the goal is to pin it.
+    pub async fn pin_window(&self, sel: &WindowSelector) -> Result<()> {
+        self.dispatch(&format!("pin {}", sel.encode())).await
+    }
+
+    /// Toggle floating mode on a specific window (not just the active one).
+    pub async fn toggle_floating_window(&self, sel: &WindowSelector) -> Result<()> {
+        self.dispatch(&format!("togglefloating {}", sel.encode())).await
+    }
+
+    /// Set fullscreen state on a specific window.
+    ///
+    /// Hyprland's `fullscreenstate` dispatcher takes two arguments: an
+    /// `internal` value (what the app thinks it has) and an `external` value
+    /// (what Hyprland renders). `-1` for either means "leave unchanged".
+    /// For restoration we typically set internal to the target mode and
+    /// leave external as `-1`.
+    ///
+    /// Mode values follow Hyprland's [`crate::types::Client::fullscreen`]
+    /// reporting: 0 = none, 1 = maximize, 2 = exclusive fullscreen.
+    pub async fn set_fullscreen_state(
+        &self,
+        sel: &WindowSelector,
+        internal: i32,
+        external: i32,
+    ) -> Result<()> {
+        self.dispatch(&format!(
+            "fullscreenstate {internal} {external},{}",
+            sel.encode()
+        ))
+        .await
+    }
 }

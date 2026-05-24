@@ -99,7 +99,7 @@ pub struct MonitorSnapshot {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RestoreAction {
     /// Window in the snapshot is not present in live state. Reported only;
-    /// not applied. Re-spawn is v0.4.
+    /// not applied. Re-spawn from cmdline is future work.
     WindowMissing {
         address: String,
         class: String,
@@ -119,11 +119,48 @@ pub enum RestoreAction {
         address: String,
         target: bool,
     },
+    /// Floating window's exact (x, y) and/or (w, h) differ. Emitted only
+    /// for floating windows — tiled windows are positioned and sized by the
+    /// layout algorithm, so trying to set exact pixels would either no-op or
+    /// fight the tiler.
+    RepositionFloating {
+        address: String,
+        target_at: [i32; 2],
+        target_size: [i32; 2],
+        current_at: [i32; 2],
+        current_size: [i32; 2],
+    },
+    /// Window's fullscreen mode differs. Applied via
+    /// `fullscreenstate <to_mode> -1,<selector>` — sets the internal mode,
+    /// leaves the external mode unchanged. No focus-storm needed.
+    ///
+    /// Modes follow Hyprland's [`crate::types::Client::fullscreen`] reporting:
+    /// 0 = none, 1 = maximize, 2 = exclusive fullscreen.
+    SetFullscreen {
+        address: String,
+        from_mode: i32,
+        to_mode: i32,
+    },
+    /// Window's pinned state differs. Applied via `pin <selector>` which
+    /// toggles. Only meaningful for floating windows — Hyprland refuses to
+    /// pin tiled windows.
+    SetPin {
+        address: String,
+        target: bool,
+    },
     /// Window present in live state but absent from snapshot. Reported
     /// only — restore is non-destructive.
     WindowNotInSnapshot {
         address: String,
         class: String,
+    },
+    /// Snapshot recorded a different focused window than live. Applied
+    /// last so it overrides any focus side-effects from earlier actions.
+    /// Only emitted when the snapshot's active window can be matched in
+    /// live state.
+    RestoreActiveFocus {
+        address: String,
+        from_address: Option<String>,
     },
 }
 
@@ -141,7 +178,12 @@ impl SnapshotDiff {
             .filter(|a| {
                 matches!(
                     a,
-                    RestoreAction::MoveToWorkspace { .. } | RestoreAction::ToggleFloating { .. }
+                    RestoreAction::MoveToWorkspace { .. }
+                        | RestoreAction::ToggleFloating { .. }
+                        | RestoreAction::RepositionFloating { .. }
+                        | RestoreAction::SetFullscreen { .. }
+                        | RestoreAction::SetPin { .. }
+                        | RestoreAction::RestoreActiveFocus { .. }
                 )
             })
             .count()
@@ -249,6 +291,10 @@ impl Snapshot {
             match matched {
                 Some(live_w) => {
                     matched_live.insert(live_w.address.as_str());
+                    // Emit in restore order so apply_diff doesn't need to
+                    // resort: workspace → floating → geometry → fullscreen
+                    // → pin. Geometry and pin only meaningful when the
+                    // window will end up floating.
                     if live_w.workspace_id != snap.workspace_id {
                         actions.push(RestoreAction::MoveToWorkspace {
                             address: live_w.address.clone(),
@@ -260,6 +306,30 @@ impl Snapshot {
                         actions.push(RestoreAction::ToggleFloating {
                             address: live_w.address.clone(),
                             target: snap.floating,
+                        });
+                    }
+                    if snap.floating
+                        && (live_w.at != snap.at || live_w.size != snap.size)
+                    {
+                        actions.push(RestoreAction::RepositionFloating {
+                            address: live_w.address.clone(),
+                            target_at: snap.at,
+                            target_size: snap.size,
+                            current_at: live_w.at,
+                            current_size: live_w.size,
+                        });
+                    }
+                    if live_w.fullscreen != snap.fullscreen {
+                        actions.push(RestoreAction::SetFullscreen {
+                            address: live_w.address.clone(),
+                            from_mode: live_w.fullscreen,
+                            to_mode: snap.fullscreen,
+                        });
+                    }
+                    if snap.floating && live_w.pinned != snap.pinned {
+                        actions.push(RestoreAction::SetPin {
+                            address: live_w.address.clone(),
+                            target: snap.pinned,
                         });
                     }
                 }
@@ -278,6 +348,20 @@ impl Snapshot {
                 actions.push(RestoreAction::WindowNotInSnapshot {
                     address: live_w.address.clone(),
                     class: live_w.class.clone(),
+                });
+            }
+        }
+
+        // Final action: refocus the snapshot's active window if it exists
+        // in live state and differs from the live focus. Emitted last so
+        // it overrides focus side-effects from any earlier mutation.
+        if let Some(target_active) = self.active_window_address.as_deref() {
+            if live.active_window_address.as_deref() != Some(target_active)
+                && live.windows.iter().any(|w| w.address == target_active)
+            {
+                actions.push(RestoreAction::RestoreActiveFocus {
+                    address: target_active.to_string(),
+                    from_address: live.active_window_address.clone(),
                 });
             }
         }
@@ -342,9 +426,42 @@ pub async fn apply_diff(conn: &Connection, diff: &SnapshotDiff) -> Vec<ApplyOutc
             }
             RestoreAction::ToggleFloating { address, .. } => {
                 let sel = WindowSelector::Address(address.clone());
-                let result = conn
-                    .dispatch(&format!("togglefloating {}", sel.encode()))
+                let result = conn.toggle_floating_window(&sel).await;
+                outcomes.push(ApplyOutcome::from(action.clone(), result));
+            }
+            RestoreAction::RepositionFloating { address, target_at, target_size, .. } => {
+                let sel = WindowSelector::Address(address.clone());
+                let move_res = conn
+                    .move_window_pixel(&sel, target_at[0], target_at[1])
                     .await;
+                if let Err(e) = move_res {
+                    outcomes.push(ApplyOutcome {
+                        action: action.clone(),
+                        ok: false,
+                        skipped: false,
+                        error: Some(format!("move: {e}")),
+                    });
+                    continue;
+                }
+                let resize_res = conn
+                    .resize_window_pixel(&sel, target_size[0], target_size[1])
+                    .await;
+                outcomes.push(ApplyOutcome::from(action.clone(), resize_res));
+            }
+            RestoreAction::SetFullscreen { address, to_mode, .. } => {
+                let sel = WindowSelector::Address(address.clone());
+                // Set internal mode to target; leave external (-1) alone.
+                let result = conn.set_fullscreen_state(&sel, *to_mode, -1).await;
+                outcomes.push(ApplyOutcome::from(action.clone(), result));
+            }
+            RestoreAction::SetPin { address, .. } => {
+                let sel = WindowSelector::Address(address.clone());
+                let result = conn.pin_window(&sel).await;
+                outcomes.push(ApplyOutcome::from(action.clone(), result));
+            }
+            RestoreAction::RestoreActiveFocus { address, .. } => {
+                let sel = WindowSelector::Address(address.clone());
+                let result = conn.focus_window(&sel).await;
                 outcomes.push(ApplyOutcome::from(action.clone(), result));
             }
             RestoreAction::WindowMissing { .. } | RestoreAction::WindowNotInSnapshot { .. } => {
@@ -622,6 +739,134 @@ mod tests {
             a,
             RestoreAction::MoveToWorkspace { address, to_workspace: 1, .. } if address == "0xnew"
         )));
+    }
+
+    #[test]
+    fn diff_floating_geometry_changed_emits_reposition() {
+        let mut target_w = win("0xa", 1, true);
+        target_w.at = [100, 200];
+        target_w.size = [800, 600];
+        let mut live_w = win("0xa", 1, true);
+        live_w.at = [0, 0];
+        live_w.size = [400, 300];
+        let target = snap(vec![target_w]);
+        let live = snap(vec![live_w]);
+        let d = target.diff_against(&live);
+        assert!(d.actions.iter().any(|a| matches!(
+            a,
+            RestoreAction::RepositionFloating { target_at: [100, 200], target_size: [800, 600], .. }
+        )));
+    }
+
+    #[test]
+    fn diff_tiled_geometry_change_emits_no_reposition() {
+        // Geometry on tiled windows is layout-driven; reposition wouldn't
+        // help and would no-op against Hyprland. Diff must not emit it.
+        let mut target_w = win("0xa", 1, false);
+        target_w.at = [100, 200];
+        let mut live_w = win("0xa", 1, false);
+        live_w.at = [0, 0];
+        let target = snap(vec![target_w]);
+        let live = snap(vec![live_w]);
+        let d = target.diff_against(&live);
+        assert!(!d
+            .actions
+            .iter()
+            .any(|a| matches!(a, RestoreAction::RepositionFloating { .. })));
+    }
+
+    #[test]
+    fn diff_fullscreen_changed_emits_set_fullscreen() {
+        let mut target_w = win("0xa", 1, false);
+        target_w.fullscreen = 2;
+        let live_w = win("0xa", 1, false); // fullscreen = 0 (default)
+        let target = snap(vec![target_w]);
+        let live = snap(vec![live_w]);
+        let d = target.diff_against(&live);
+        assert!(d.actions.iter().any(|a| matches!(
+            a,
+            RestoreAction::SetFullscreen { from_mode: 0, to_mode: 2, .. }
+        )));
+    }
+
+    #[test]
+    fn diff_pin_changed_emits_set_pin_only_when_floating() {
+        // Floating: pin diff produces an action.
+        let mut t = win("0xa", 1, true);
+        t.pinned = true;
+        let target = snap(vec![t]);
+        let live = snap(vec![win("0xa", 1, true)]);
+        let d = target.diff_against(&live);
+        assert!(d.actions.iter().any(|a| matches!(
+            a,
+            RestoreAction::SetPin { target: true, .. }
+        )));
+
+        // Tiled: pin diff is suppressed (Hyprland refuses to pin tiled).
+        let mut t = win("0xb", 1, false);
+        t.pinned = true;
+        let target = snap(vec![t]);
+        let live = snap(vec![win("0xb", 1, false)]);
+        let d = target.diff_against(&live);
+        assert!(!d
+            .actions
+            .iter()
+            .any(|a| matches!(a, RestoreAction::SetPin { .. })));
+    }
+
+    #[test]
+    fn diff_active_focus_emits_when_target_window_present() {
+        let mut target = snap(vec![win("0xa", 1, false), win("0xb", 2, false)]);
+        target.active_window_address = Some("0xa".into());
+        let mut live = snap(vec![win("0xa", 1, false), win("0xb", 2, false)]);
+        live.active_window_address = Some("0xb".into());
+        let d = target.diff_against(&live);
+        assert!(matches!(
+            d.actions.last().unwrap(),
+            RestoreAction::RestoreActiveFocus { address, .. } if address == "0xa"
+        ));
+    }
+
+    #[test]
+    fn diff_active_focus_suppressed_when_target_window_missing() {
+        let mut target = snap(vec![win("0xa", 1, false)]);
+        target.active_window_address = Some("0xdead".into()); // not present in live
+        let live = snap(vec![win("0xa", 1, false)]);
+        let d = target.diff_against(&live);
+        assert!(!d
+            .actions
+            .iter()
+            .any(|a| matches!(a, RestoreAction::RestoreActiveFocus { .. })));
+    }
+
+    #[test]
+    fn diff_actions_emitted_in_restore_order() {
+        // For a single window: workspace → floating → reposition → fullscreen → pin.
+        let mut target_w = win("0xa", 2, true);
+        target_w.at = [50, 50];
+        target_w.size = [400, 300];
+        target_w.fullscreen = 1;
+        target_w.pinned = true;
+        let live_w = win("0xa", 1, false); // everything different
+        let target = snap(vec![target_w]);
+        let live = snap(vec![live_w]);
+        let d = target.diff_against(&live);
+        let kinds: Vec<&str> = d
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                RestoreAction::MoveToWorkspace { .. } => Some("workspace"),
+                RestoreAction::ToggleFloating { .. } => Some("floating"),
+                RestoreAction::RepositionFloating { .. } => Some("reposition"),
+                RestoreAction::SetFullscreen { .. } => Some("fullscreen"),
+                RestoreAction::SetPin { .. } => Some("pin"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["workspace", "floating", "reposition", "fullscreen", "pin"]
+        );
     }
 
     #[test]

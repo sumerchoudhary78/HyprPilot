@@ -344,15 +344,27 @@ fn tool_error(id: Value, code: ErrorCode, message: String) -> JsonRpcResponse {
 /// Format a `SnapshotDiff` into a human-readable preview body for
 /// `snapshot_restore --dry-run`. Caps the action list at 10 lines; an
 /// agent that wants the full list can still call `snapshot_diff` directly.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
 fn render_restore_preview(name: &str, diff: &SnapshotDiff) -> String {
     let mut moves = 0usize;
     let mut floats = 0usize;
+    let mut repositions = 0usize;
+    let mut fullscreens = 0usize;
+    let mut pins = 0usize;
+    let mut refocus = 0usize;
     let mut missing = 0usize;
     let mut extra = 0usize;
     for a in &diff.actions {
         match a {
             RestoreAction::MoveToWorkspace { .. } => moves += 1,
             RestoreAction::ToggleFloating { .. } => floats += 1,
+            RestoreAction::RepositionFloating { .. } => repositions += 1,
+            RestoreAction::SetFullscreen { .. } => fullscreens += 1,
+            RestoreAction::SetPin { .. } => pins += 1,
+            RestoreAction::RestoreActiveFocus { .. } => refocus += 1,
             RestoreAction::WindowMissing { .. } => missing += 1,
             RestoreAction::WindowNotInSnapshot { .. } => extra += 1,
         }
@@ -361,10 +373,15 @@ fn render_restore_preview(name: &str, diff: &SnapshotDiff) -> String {
     let mut out = String::new();
     out.push_str(&format!("[dry_run] would restore snapshot `{name}`:\n"));
     out.push_str(&format!(
-        "  {moves} window move{}, {floats} float toggle{}, {missing} missing, \
-         {extra} not in snapshot\n",
-        if moves == 1 { "" } else { "s" },
-        if floats == 1 { "" } else { "s" },
+        "  {moves} workspace move{}, {floats} float toggle{}, \
+         {repositions} reposition{}, {fullscreens} fullscreen change{}, \
+         {pins} pin toggle{}, {refocus} refocus, \
+         {missing} missing, {extra} not in snapshot\n",
+        plural(moves),
+        plural(floats),
+        plural(repositions),
+        plural(fullscreens),
+        plural(pins),
     ));
 
     if diff.mutation_count() == 0 {
@@ -378,7 +395,12 @@ fn render_restore_preview(name: &str, diff: &SnapshotDiff) -> String {
             .filter(|a| {
                 matches!(
                     a,
-                    RestoreAction::MoveToWorkspace { .. } | RestoreAction::ToggleFloating { .. }
+                    RestoreAction::MoveToWorkspace { .. }
+                        | RestoreAction::ToggleFloating { .. }
+                        | RestoreAction::RepositionFloating { .. }
+                        | RestoreAction::SetFullscreen { .. }
+                        | RestoreAction::SetPin { .. }
+                        | RestoreAction::RestoreActiveFocus { .. }
                 )
             })
             .collect();
@@ -392,6 +414,38 @@ fn render_restore_preview(name: &str, diff: &SnapshotDiff) -> String {
                 RestoreAction::ToggleFloating { address, target } => {
                     out.push_str(&format!(
                         "  toggle floating address:{address} → {target}\n"
+                    ));
+                }
+                RestoreAction::RepositionFloating {
+                    address,
+                    target_at,
+                    target_size,
+                    ..
+                } => {
+                    out.push_str(&format!(
+                        "  reposition address:{address} → at=({},{}) size=({},{})\n",
+                        target_at[0], target_at[1], target_size[0], target_size[1]
+                    ));
+                }
+                RestoreAction::SetFullscreen { address, to_mode, .. } => {
+                    let label = match to_mode {
+                        0 => "none".to_string(),
+                        1 => "maximize".to_string(),
+                        2 => "fullscreen".to_string(),
+                        n => format!("mode {n}"),
+                    };
+                    out.push_str(&format!(
+                        "  fullscreen address:{address} → {label}\n"
+                    ));
+                }
+                RestoreAction::SetPin { address, target } => {
+                    out.push_str(&format!(
+                        "  pin address:{address} → {target}\n"
+                    ));
+                }
+                RestoreAction::RestoreActiveFocus { address, .. } => {
+                    out.push_str(&format!(
+                        "  refocus address:{address}\n"
                     ));
                 }
                 _ => {}
