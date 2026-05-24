@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -10,6 +11,7 @@ use hyprpilot_core::selector::{WindowSelector, WorkspaceRef};
 use hyprpilot_core::Connection;
 use hyprpilot_daemon::{client::DaemonClient, default_socket_path, protocol::Request};
 use hyprpilot_input::keys::{KeyCombo, MouseButton};
+use hyprpilot_vision::{GrimCapture, ImageFormat, Psm, Region, TesseractOcr};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -69,6 +71,96 @@ enum Cmd {
     /// daemon's environment.
     #[command(subcommand)]
     Input(InputCmd),
+    /// Screen capture via `grim` (wlr-screencopy).
+    #[command(subcommand)]
+    Capture(CaptureCmd),
+    /// OCR via `tesseract`. Captures with `grim` then extracts text.
+    #[command(subcommand)]
+    Ocr(OcrCmd),
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum ImageFormatArg {
+    Png,
+    Jpeg,
+    Ppm,
+}
+
+impl ImageFormatArg {
+    fn into_vision(self) -> ImageFormat {
+        match self {
+            ImageFormatArg::Png => ImageFormat::Png,
+            ImageFormatArg::Jpeg => ImageFormat::Jpeg,
+            ImageFormatArg::Ppm => ImageFormat::Ppm,
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
+enum CaptureCmd {
+    /// Capture the whole compositor (or a single monitor).
+    Full {
+        /// Monitor name (e.g. `eDP-1`). Omit for the whole compositor.
+        #[arg(long)]
+        monitor: Option<String>,
+        /// Include the mouse cursor in the capture.
+        #[arg(long)]
+        cursor: bool,
+        /// Image format. Defaults to `png`.
+        #[arg(long, value_enum, default_value_t = ImageFormatArg::Png)]
+        format: ImageFormatArg,
+        /// File to write image bytes to. If omitted, writes to stdout.
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
+    /// Capture a rectangular region of the compositor.
+    Region {
+        #[arg(allow_hyphen_values = true)]
+        x: i32,
+        #[arg(allow_hyphen_values = true)]
+        y: i32,
+        w: u32,
+        h: u32,
+        /// Include the mouse cursor in the capture.
+        #[arg(long)]
+        cursor: bool,
+        /// Image format. Defaults to `png`.
+        #[arg(long, value_enum, default_value_t = ImageFormatArg::Png)]
+        format: ImageFormatArg,
+        /// File to write image bytes to. If omitted, writes to stdout.
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum OcrCmd {
+    /// OCR the full screen. Prints text to stdout.
+    Screen {
+        /// Tesseract language code, e.g. `eng`, `eng+fra`. Defaults to `eng`.
+        #[arg(long, default_value = "eng")]
+        lang: String,
+        /// Tesseract page-segmentation mode. One of: 3 (auto), 6
+        /// (single-block, default), 7 (single-line), 11 (sparse).
+        #[arg(long, default_value_t = 6)]
+        psm: u8,
+    },
+    /// OCR a rectangular region of the screen.
+    Region {
+        #[arg(allow_hyphen_values = true)]
+        x: i32,
+        #[arg(allow_hyphen_values = true)]
+        y: i32,
+        w: u32,
+        h: u32,
+        /// Tesseract language code, e.g. `eng`, `eng+fra`. Defaults to `eng`.
+        #[arg(long, default_value = "eng")]
+        lang: String,
+        /// Tesseract page-segmentation mode. One of: 3 (auto), 6
+        /// (single-block, default), 7 (single-line), 11 (sparse).
+        #[arg(long, default_value_t = 6)]
+        psm: u8,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -307,6 +399,72 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Snapshot(s) => run_snapshot_cmd(s, cli.daemon_socket.as_deref(), cli.json).await,
         Cmd::Rules(r) => run_rules_cmd(r, cli.daemon_socket.as_deref(), cli.json).await,
         Cmd::Input(i) => run_input_cmd(i, cli.daemon_socket.as_deref(), cli.json).await,
+        Cmd::Capture(c) => run_capture_cmd(c).await,
+        Cmd::Ocr(o) => run_ocr_cmd(o).await,
+    }
+}
+
+async fn run_capture_cmd(c: CaptureCmd) -> Result<()> {
+    let grim = GrimCapture::detect()?;
+    let (bytes, output) = match c {
+        CaptureCmd::Full { monitor, cursor, format, output } => {
+            let g = grim.with_cursor(cursor);
+            let bytes = g.full(monitor.as_deref(), format.into_vision()).await?;
+            (bytes, output)
+        }
+        CaptureCmd::Region { x, y, w, h, cursor, format, output } => {
+            let g = grim.with_cursor(cursor);
+            let bytes = g.region(Region { x, y, w, h }, format.into_vision()).await?;
+            (bytes, output)
+        }
+    };
+    write_bytes(output.as_deref(), &bytes)
+}
+
+fn write_bytes(output: Option<&std::path::Path>, bytes: &[u8]) -> Result<()> {
+    match output {
+        Some(path) => std::fs::write(path, bytes)
+            .with_context(|| format!("write capture bytes to {}", path.display())),
+        None => {
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            lock.write_all(bytes).context("write capture bytes to stdout")
+        }
+    }
+}
+
+async fn run_ocr_cmd(o: OcrCmd) -> Result<()> {
+    let grim = GrimCapture::detect()?;
+    let (lang, psm_raw, image) = match o {
+        OcrCmd::Screen { lang, psm } => {
+            let bytes = grim.full(None, ImageFormat::Png).await?;
+            (lang, psm, bytes)
+        }
+        OcrCmd::Region { x, y, w, h, lang, psm } => {
+            let bytes = grim.region(Region { x, y, w, h }, ImageFormat::Png).await?;
+            (lang, psm, bytes)
+        }
+    };
+    let psm = parse_psm(psm_raw).map_err(|e| anyhow!(e))?;
+    let ocr = TesseractOcr::detect()?.with_lang(lang).with_psm(psm);
+    let text = ocr.extract_text(&image).await?;
+    println!("{text}");
+    Ok(())
+}
+
+/// Map a numeric `--psm` to the Psm enum. We deliberately accept only the
+/// four modes that are useful for UI screenshots — auto (3), single-block
+/// (6, default), single-line (7), sparse (11). Other values reject early
+/// with a clear hint rather than silently passing through to tesseract.
+fn parse_psm(mode: u8) -> std::result::Result<Psm, String> {
+    match mode {
+        3 => Ok(Psm::Auto),
+        6 => Ok(Psm::SingleBlock),
+        7 => Ok(Psm::SingleLine),
+        11 => Ok(Psm::SparseText),
+        other => Err(format!(
+            "unsupported --psm value `{other}`: expected one of 3 (auto), 6 (single-block), 7 (single-line), 11 (sparse)"
+        )),
     }
 }
 
@@ -662,6 +820,72 @@ mod tests {
                 assert_eq!((x, y, absolute), (-5, -5, true));
             }
             other => panic!("expected Input MouseMove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_psm_accepts_supported_modes() {
+        assert!(matches!(parse_psm(3), Ok(Psm::Auto)));
+        assert!(matches!(parse_psm(6), Ok(Psm::SingleBlock)));
+        assert!(matches!(parse_psm(7), Ok(Psm::SingleLine)));
+        assert!(matches!(parse_psm(11), Ok(Psm::SparseText)));
+    }
+
+    #[test]
+    fn parse_psm_rejects_zero_with_clear_error() {
+        let err = parse_psm(0).expect_err("psm 0 should reject");
+        assert!(err.contains("unsupported --psm value"), "got: {err}");
+        assert!(err.contains("0"), "got: {err}");
+        // The hint should enumerate the accepted modes.
+        assert!(err.contains("3"), "got: {err}");
+        assert!(err.contains("6"), "got: {err}");
+        assert!(err.contains("7"), "got: {err}");
+        assert!(err.contains("11"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_psm_rejects_twelve_with_clear_error() {
+        let err = parse_psm(12).expect_err("psm 12 should reject");
+        assert!(err.contains("unsupported --psm value"), "got: {err}");
+        assert!(err.contains("12"), "got: {err}");
+    }
+
+    #[test]
+    fn capture_region_parses_negative_origin() {
+        let cli = Cli::parse_from([
+            "hyprpilot", "capture", "region", "-10", "-20", "100", "50",
+        ]);
+        match cli.cmd {
+            Cmd::Capture(CaptureCmd::Region { x, y, w, h, .. }) => {
+                assert_eq!((x, y, w, h), (-10, -20, 100, 50));
+            }
+            other => panic!("expected Capture Region, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capture_full_default_format_is_png() {
+        let cli = Cli::parse_from(["hyprpilot", "capture", "full"]);
+        match cli.cmd {
+            Cmd::Capture(CaptureCmd::Full { format, cursor, monitor, output }) => {
+                assert!(matches!(format, ImageFormatArg::Png));
+                assert!(!cursor);
+                assert!(monitor.is_none());
+                assert!(output.is_none());
+            }
+            other => panic!("expected Capture Full, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ocr_screen_defaults() {
+        let cli = Cli::parse_from(["hyprpilot", "ocr", "screen"]);
+        match cli.cmd {
+            Cmd::Ocr(OcrCmd::Screen { lang, psm }) => {
+                assert_eq!(lang, "eng");
+                assert_eq!(psm, 6);
+            }
+            other => panic!("expected Ocr Screen, got {other:?}"),
         }
     }
 }

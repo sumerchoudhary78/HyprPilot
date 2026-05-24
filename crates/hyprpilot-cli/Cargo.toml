@@ -15,6 +15,7 @@ path = "src/main.rs"
 hyprpilot-core = { workspace = true }
 hyprpilot-daemon = { workspace = true }
 hyprpilot-input = { workspace = true }
+hyprpilot-vision = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
