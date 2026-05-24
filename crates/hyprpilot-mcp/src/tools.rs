@@ -27,6 +27,7 @@ use hyprpilot_core::dispatch::{Direction, FullscreenMode};
 use hyprpilot_core::selector::{WindowSelector, WorkspaceRef};
 use hyprpilot_daemon::protocol::Request;
 use hyprpilot_input::keys::{KeyCombo, MouseButton};
+use hyprpilot_vision::{ImageFormat as VisionImageFormat, Psm, Region};
 
 use crate::capability::ToolGroup;
 
@@ -55,6 +56,39 @@ pub enum Dispatch {
     /// into a structured dry-run preview for `snapshot_restore`. Lets the
     /// agent see exactly what would change without applying anything.
     PreviewSnapshotRestore { name: String },
+    /// Capture an image directly via `hyprpilot-vision`. Daemon-agnostic:
+    /// capture is stateless and the bytes are bulky, so it would be wasteful
+    /// to round-trip them through the daemon's newline-JSON RPC.
+    Capture(CaptureOp),
+    /// OCR a captured image. Same daemon-bypass reasoning as `Capture`.
+    Ocr(OcrOp),
+}
+
+/// What to capture and how. Image format is resolved here so we don't pass
+/// stringy formats further than necessary.
+#[derive(Debug)]
+pub enum CaptureOp {
+    /// Capture the whole compositor, or a specific monitor if `monitor` is set.
+    Full {
+        monitor: Option<String>,
+        cursor: bool,
+        format: VisionImageFormat,
+    },
+    /// Capture a rectangular region.
+    Region {
+        region: Region,
+        cursor: bool,
+        format: VisionImageFormat,
+    },
+}
+
+/// What to OCR.
+#[derive(Debug)]
+pub enum OcrOp {
+    /// OCR the whole compositor.
+    Screen { lang: String, psm: Psm },
+    /// OCR a specific region.
+    Region { region: Region, lang: String, psm: Psm },
 }
 
 /// Parameter-parsing or validation failure.
@@ -283,6 +317,124 @@ pub struct InputMouseClickArgs {
     /// Pass `false` to actually apply the change.
     #[serde(default = "default_true")]
     pub dry_run: bool,
+}
+
+/// Image format exposed to LLMs. `ppm` is intentionally not exposed —
+/// niche, large, and offers no advantage over PNG for screenshots.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageFormatArg {
+    #[default]
+    Png,
+    Jpeg,
+}
+
+impl ImageFormatArg {
+    fn to_vision(self) -> VisionImageFormat {
+        match self {
+            ImageFormatArg::Png => VisionImageFormat::Png,
+            ImageFormatArg::Jpeg => VisionImageFormat::Jpeg,
+        }
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ScreenshotArgs {
+    /// Optional monitor name (e.g. `eDP-1`, `HDMI-A-1`). When unset,
+    /// captures the entire compositor across all monitors.
+    #[serde(default)]
+    pub monitor: Option<String>,
+    /// Include the mouse cursor in the capture. Defaults to `false`.
+    #[serde(default)]
+    pub cursor: bool,
+    /// Image format: `png` (default, lossless) or `jpeg` (smaller, lossy).
+    #[serde(default)]
+    pub format: ImageFormatArg,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ScreenshotRegionArgs {
+    /// Top-left X in compositor pixel coordinates (may be negative).
+    pub x: i32,
+    /// Top-left Y in compositor pixel coordinates (may be negative).
+    pub y: i32,
+    /// Region width in pixels. Must be > 0.
+    pub w: u32,
+    /// Region height in pixels. Must be > 0.
+    pub h: u32,
+    /// Include the mouse cursor in the capture. Defaults to `false`.
+    #[serde(default)]
+    pub cursor: bool,
+    /// Image format: `png` (default, lossless) or `jpeg` (smaller, lossy).
+    #[serde(default)]
+    pub format: ImageFormatArg,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ScreenshotMonitorArgs {
+    /// Monitor name (e.g. `eDP-1`, `HDMI-A-1`). Matches `hyprctl monitors`.
+    pub name: String,
+    /// Include the mouse cursor in the capture. Defaults to `false`.
+    #[serde(default)]
+    pub cursor: bool,
+    /// Image format: `png` (default, lossless) or `jpeg` (smaller, lossy).
+    #[serde(default)]
+    pub format: ImageFormatArg,
+}
+
+fn default_lang() -> String {
+    "eng".to_string()
+}
+
+fn default_psm() -> u8 {
+    6
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct OcrScreenArgs {
+    /// Tesseract language code (e.g. `eng`, `fra`, `eng+fra`). Default `eng`.
+    #[serde(default = "default_lang")]
+    pub lang: String,
+    /// Page-segmentation mode. One of: 3 (auto), 6 (single uniform block,
+    /// default), 7 (single line), 11 (sparse text).
+    #[serde(default = "default_psm")]
+    pub psm: u8,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct OcrRegionArgs {
+    /// Top-left X in compositor pixel coordinates (may be negative).
+    pub x: i32,
+    /// Top-left Y in compositor pixel coordinates (may be negative).
+    pub y: i32,
+    /// Region width in pixels. Must be > 0.
+    pub w: u32,
+    /// Region height in pixels. Must be > 0.
+    pub h: u32,
+    /// Tesseract language code (e.g. `eng`, `fra`, `eng+fra`). Default `eng`.
+    #[serde(default = "default_lang")]
+    pub lang: String,
+    /// Page-segmentation mode. One of: 3 (auto), 6 (single uniform block,
+    /// default), 7 (single line), 11 (sparse text).
+    #[serde(default = "default_psm")]
+    pub psm: u8,
+}
+
+/// Convert a wire-side PSM number into the typed [`Psm`]. Only the four
+/// useful values are accepted; everything else is an `InvalidArgs`.
+fn parse_psm(tool: &str, n: u8) -> Result<Psm, DispatchError> {
+    match n {
+        3 => Ok(Psm::Auto),
+        6 => Ok(Psm::SingleBlock),
+        7 => Ok(Psm::SingleLine),
+        11 => Ok(Psm::SparseText),
+        other => Err(DispatchError::InvalidArgs {
+            tool: tool.to_string(),
+            message: format!(
+                "psm must be one of 3, 6, 7, 11; got {other}"
+            ),
+        }),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -631,6 +783,53 @@ pub fn registry() -> Vec<ToolDef> {
              ydotool. Button names: left, right, middle, x1/back, \
              x2/forward. Same gates as input_mouse_move.",
         ),
+        // ---- Vision (group: vision) — NOT in default profile ----------------
+        def::<ScreenshotArgs>(
+            "screenshot",
+            Vision,
+            false,
+            "Capture a screenshot of the entire compositor (or a single \
+             monitor if `monitor` is set). Returns the raw image bytes as a \
+             single MCP `image` content block, base64-encoded. Defaults: \
+             full compositor, no cursor, PNG. Privacy: this captures \
+             whatever is on screen, including potentially sensitive content; \
+             the `vision` capability group is NOT in the default profile.",
+        ),
+        def::<ScreenshotRegionArgs>(
+            "screenshot_region",
+            Vision,
+            false,
+            "Capture a rectangular region of the compositor in pixel \
+             coordinates. `(x, y)` is the top-left corner; `w` and `h` are \
+             the dimensions. Coordinates may be negative (multi-monitor \
+             layouts). Returns the image as a base64 MCP `image` block. \
+             Same privacy caveats as `screenshot`.",
+        ),
+        def::<ScreenshotMonitorArgs>(
+            "screenshot_monitor",
+            Vision,
+            false,
+            "Capture a specific monitor by name (e.g. `eDP-1`). \
+             Shortcut equivalent to `screenshot` with `monitor` set. \
+             Returns the image as a base64 MCP `image` block.",
+        ),
+        def::<OcrScreenArgs>(
+            "ocr_screen",
+            Vision,
+            false,
+            "Run tesseract OCR over the entire compositor capture and \
+             return the extracted text. Defaults: language `eng`, PSM 6 \
+             (single uniform block). Returns a `text` content block — \
+             empty if tesseract found no text.",
+        ),
+        def::<OcrRegionArgs>(
+            "ocr_region",
+            Vision,
+            false,
+            "Capture a rectangular region of the compositor and run OCR \
+             over it. Useful for reading a single dialog or panel without \
+             OCR noise from the rest of the screen.",
+        ),
     ]
 }
 
@@ -855,6 +1054,52 @@ pub fn dispatch(name: &str, args: Value) -> Result<Dispatch, DispatchError> {
             )
         }
 
+        // ---- vision -------------------------------------------------------
+        "screenshot" => {
+            let p: ScreenshotArgs = parse_args(name, args)?;
+            Ok(Dispatch::Capture(CaptureOp::Full {
+                monitor: p.monitor,
+                cursor: p.cursor,
+                format: p.format.to_vision(),
+            }))
+        }
+        "screenshot_region" => {
+            let p: ScreenshotRegionArgs = parse_args(name, args)?;
+            let region = Region { x: p.x, y: p.y, w: p.w, h: p.h };
+            region.validate().map_err(|e| DispatchError::InvalidArgs {
+                tool: name.to_string(),
+                message: e.to_string(),
+            })?;
+            Ok(Dispatch::Capture(CaptureOp::Region {
+                region,
+                cursor: p.cursor,
+                format: p.format.to_vision(),
+            }))
+        }
+        "screenshot_monitor" => {
+            let p: ScreenshotMonitorArgs = parse_args(name, args)?;
+            Ok(Dispatch::Capture(CaptureOp::Full {
+                monitor: Some(p.name),
+                cursor: p.cursor,
+                format: p.format.to_vision(),
+            }))
+        }
+        "ocr_screen" => {
+            let p: OcrScreenArgs = parse_args(name, args)?;
+            let psm = parse_psm(name, p.psm)?;
+            Ok(Dispatch::Ocr(OcrOp::Screen { lang: p.lang, psm }))
+        }
+        "ocr_region" => {
+            let p: OcrRegionArgs = parse_args(name, args)?;
+            let psm = parse_psm(name, p.psm)?;
+            let region = Region { x: p.x, y: p.y, w: p.w, h: p.h };
+            region.validate().map_err(|e| DispatchError::InvalidArgs {
+                tool: name.to_string(),
+                message: e.to_string(),
+            })?;
+            Ok(Dispatch::Ocr(OcrOp::Region { region, lang: p.lang, psm }))
+        }
+
         other => Err(DispatchError::UnknownTool(other.to_string())),
     }
 }
@@ -989,7 +1234,7 @@ mod tests {
     fn registry_count() {
         // Lock the surface so additions are deliberate. Update this number
         // intentionally when adding/removing tools.
-        assert_eq!(registry().len(), 40);
+        assert_eq!(registry().len(), 45);
     }
 
     #[test]

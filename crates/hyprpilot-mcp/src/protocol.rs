@@ -189,16 +189,32 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// One piece of structured output from a tool. We only emit text blocks; the
-/// MCP spec also defines image and resource blocks which we don't use.
+/// One piece of structured output from a tool. We emit text and image
+/// blocks; the MCP spec also defines resource blocks which we don't use.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Content {
-    Text { text: String },
+    Text {
+        text: String,
+    },
+    Image {
+        /// Base64-encoded image bytes.
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
 }
 
 impl Content {
     pub fn text(s: impl Into<String>) -> Self {
         Content::Text { text: s.into() }
+    }
+
+    /// Build an `Image` content block from raw bytes. The bytes are
+    /// base64-encoded (standard alphabet, with padding) per the MCP spec.
+    pub fn image(bytes: &[u8], mime: impl Into<String>) -> Self {
+        use base64::Engine as _;
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        Content::Image { data, mime_type: mime.into() }
     }
 }

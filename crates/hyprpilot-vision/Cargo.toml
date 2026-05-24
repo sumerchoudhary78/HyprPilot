@@ -1,0 +1,14 @@
+[package]
+name = "hyprpilot-vision"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Screen capture (grim) and OCR (tesseract) for HyprPilot"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
