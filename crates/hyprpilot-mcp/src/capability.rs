@@ -48,6 +48,9 @@ pub enum ToolGroup {
     /// can run arbitrary shell commands in any focused terminal.
     /// NOT in the default profile; daemon-side env-var gate also applies.
     Input,
+    /// Screen capture + OCR. Mildly privacy-sensitive (screenshots can
+    /// contain private content), so opt-in only. NOT in the default profile.
+    Vision,
 }
 
 impl ToolGroup {
@@ -62,6 +65,7 @@ impl ToolGroup {
             ToolGroup::Snapshot => "snapshot",
             ToolGroup::Rules => "rules",
             ToolGroup::Input => "input",
+            ToolGroup::Vision => "vision",
         }
     }
 }
@@ -78,8 +82,9 @@ pub struct Profile {
 }
 
 impl Profile {
-    /// Built-in safe-by-default profile. Read, window, workspace, undo,
-    /// snapshot, rules. No destructive, no process spawn.
+    /// Built-in safe-by-default profile. Allows: read, window, workspace,
+    /// undo, snapshot, rules. Excludes: destructive, process spawn, input
+    /// synthesis, vision (screenshots / OCR can capture private content).
     pub fn default_safe() -> Self {
         let mut allow = HashSet::new();
         allow.insert(ToolGroup::Read);
@@ -109,6 +114,7 @@ impl Profile {
             ToolGroup::Snapshot,
             ToolGroup::Rules,
             ToolGroup::Input,
+            ToolGroup::Vision,
         ] {
             allow.insert(g);
         }
