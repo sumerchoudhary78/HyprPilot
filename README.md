@@ -1,12 +1,14 @@
 # HyprPilot
 
 Programmatic control of Hyprland for AI agents and humans. Typed Rust IPC
-client, long-running daemon with undo and snapshots, CLI, and an MCP server.
+client, long-running daemon with undo and snapshots, CLI, MCP server, input
+synthesis, and screen capture + OCR.
 
-> Status: v0.3 in development. v0.2 shipped MCP, capability profiles, and
-> dry-run. v0.3 adds named snapshots (capture / list / diff / restore /
-> delete) and persistent undo across daemon restarts. Rules engine, input
-> synthesis, and screen capture remain future milestones.
+> Status: v0.6 in development. Adds screen capture (`grim`) and OCR
+> (`tesseract`) as a new `hyprpilot-vision` crate, with five new MCP tools
+> in a `Vision` capability group (excluded from the default profile because
+> screenshots can capture private content) and matching `hyprpilot capture`
+> / `hyprpilot ocr` CLI subcommands.
 
 ## Crates
 
@@ -19,6 +21,11 @@ client, long-running daemon with undo and snapshots, CLI, and an MCP server.
 - `hyprpilot-mcp` — `hyprpilot-mcp` stdio MCP server. Exposes Hyprland
   control to MCP hosts (Claude Desktop, Claude Code) as typed tools with
   capability profiles and dry-run default.
+- `hyprpilot-input` — input synthesis (typing, key chords, mouse) via
+  `wtype`, `ydotool`, and Hyprland's `sendshortcut`.
+- `hyprpilot-vision` — screen capture via `grim` (wlr-screencopy) and
+  OCR via `tesseract`. Daemon-agnostic: image bytes are bulky and
+  stateless, so the CLI and MCP server call into this crate directly.
 
 ## Quick start (CLI)
 
@@ -220,6 +227,42 @@ Editing `rules.toml` while the daemon is running has no effect — the
 engine uses the version it loaded at startup. Restart the daemon to
 reload.
 
+### Screen capture + OCR (v0.6)
+
+The `hyprpilot-vision` crate shells out to `grim` (wlr-screencopy) for
+capture and `tesseract` for OCR. Both binaries are detected at
+construction time; missing → typed error.
+
+```sh
+# CLI — image bytes go to --output or stdout.
+hyprpilot capture full   --monitor eDP-1  --output /tmp/screen.png
+hyprpilot capture region 0 0 1920 1080    --output /tmp/region.jpeg --format jpeg
+
+# OCR a region.
+hyprpilot ocr region 100 200 800 400 --lang eng --psm 6
+```
+
+MCP tools (group: `vision`, opt-in only, NOT in the default profile):
+
+| Tool                  | Result                                                              |
+|-----------------------|---------------------------------------------------------------------|
+| `screenshot`          | `Content::Image` block (base64 PNG/JPEG); whole compositor          |
+| `screenshot_region`   | `Content::Image`; rectangular region                                |
+| `screenshot_monitor`  | `Content::Image`; single named monitor                              |
+| `ocr_screen`          | `Content::Text`; extracted text from the whole screen               |
+| `ocr_region`          | `Content::Text`; extracted text from a region                       |
+
+Vision is excluded from `Profile::default_safe()` because screenshots can
+capture private content. To grant it, list `vision` in a custom profile's
+`allow` (see `docs/profile.example.toml`) or use `--profile unrestricted`
+for trusted local development.
+
+Both backends are graceful about misuse:
+
+- Missing binary → `backend `grim` is not installed (or not on $PATH)`.
+- Zero-dimension region → `invalid region: width and height must be > 0`.
+- Tesseract finding no text in a blank image → empty string (success), not an error.
+
 ## Design
 
 - The compositor's IPC is the source of truth. We do not cache.
@@ -241,9 +284,16 @@ reload.
     in `snapshot_restore`.
   - **rules engine**: daemon-side reactions to socket2 events with TOML
     rule files, first-match semantics, reentrance-guarded execution.
-- v0.5 (in progress):
+- v0.5 (done):
   - **input synthesis**: typing, key chords, mouse via `wtype`,
     `ydotool`, and Hyprland's `sendshortcut`. Gated by env var +
     capability profile.
-- v0.6: screen capture + OCR.
-- v0.7: libei migration (replaces wtype/ydotool with Wayland-native EI).
+- v0.6 (in progress):
+  - **screen capture**: `grim`-backed PNG / JPEG capture (full,
+    per-monitor, region) via new `hyprpilot-vision` crate.
+  - **OCR**: `tesseract`-backed text extraction.
+  - **MCP `Content::Image`** with base64 PNG/JPEG plus 5 new tools
+    in `ToolGroup::Vision` (opt-in only).
+- v0.7: libei migration (replaces wtype/ydotool with Wayland-native EI);
+  composite tools (`click_text`, `find_text_position`); rich preview
+  for snapshot-restore that embeds the diff actions.

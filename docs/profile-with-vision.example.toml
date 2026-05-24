@@ -1,0 +1,35 @@
+# HyprPilot capability profile that enables the screen capture + OCR tools.
+#
+# Save to: $XDG_CONFIG_HOME/hyprpilot/profiles/<name>.toml
+# (typically ~/.config/hyprpilot/profiles/<name>.toml)
+#
+# Run the MCP server with:
+#   hyprpilot-mcp --profile <name>
+#
+# Vision is opt-in because screenshots and OCR can capture private content
+# (passwords on screen, sensitive documents, chat messages). Use this
+# profile only when the agent's purpose justifies seeing your screen.
+
+# Default-safe groups plus vision.
+allow = ["read", "window", "workspace", "undo", "snapshot", "rules", "vision"]
+
+# Optional refinements. Keep specific vision tools off even when the group
+# is allowed.
+deny_tools = [
+    # Block full-screen capture; keep regional. Useful when you want the
+    # agent to look at one panel but not your entire desktop.
+    # "screenshot",
+
+    # Block OCR. Capture-only when you want the agent to see images but
+    # not auto-extract any text it can read.
+    # "ocr_screen",
+    # "ocr_region",
+]
+
+# Required system packages on Linux:
+#   - `grim`       (wlr-screencopy client) for capture
+#   - `tesseract`  (with at least the language pack for your text, e.g.
+#                   `tesseract-ocr-eng`) for OCR
+#
+# Both are detected at construction time. Missing → typed
+# `backend ... not installed` error.
