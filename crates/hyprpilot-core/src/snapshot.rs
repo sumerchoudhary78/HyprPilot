@@ -99,7 +99,7 @@ pub struct MonitorSnapshot {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RestoreAction {
     /// Window in the snapshot is not present in live state. Reported only;
-    /// not applied. Re-spawn is v0.4.
+    /// not applied. Re-spawn from cmdline is future work.
     WindowMissing {
         address: String,
         class: String,
@@ -116,6 +116,35 @@ pub enum RestoreAction {
     /// `togglefloating address:<addr>` (which acts as set-to-target given
     /// we computed the diff against current state).
     ToggleFloating {
+        address: String,
+        target: bool,
+    },
+    /// Floating window's exact (x, y) and/or (w, h) differ. Emitted only
+    /// for floating windows — tiled windows are positioned and sized by the
+    /// layout algorithm, so trying to set exact pixels would either no-op or
+    /// fight the tiler.
+    RepositionFloating {
+        address: String,
+        target_at: [i32; 2],
+        target_size: [i32; 2],
+        current_at: [i32; 2],
+        current_size: [i32; 2],
+    },
+    /// Window's fullscreen mode differs. Applied via
+    /// `fullscreenstate <to_mode> -1,<selector>` — sets the internal mode,
+    /// leaves the external mode unchanged. No focus-storm needed.
+    ///
+    /// Modes follow Hyprland's [`crate::types::Client::fullscreen`] reporting:
+    /// 0 = none, 1 = maximize, 2 = exclusive fullscreen.
+    SetFullscreen {
+        address: String,
+        from_mode: i32,
+        to_mode: i32,
+    },
+    /// Window's pinned state differs. Applied via `pin <selector>` which
+    /// toggles. Only meaningful for floating windows — Hyprland refuses to
+    /// pin tiled windows.
+    SetPin {
         address: String,
         target: bool,
     },
@@ -141,7 +170,11 @@ impl SnapshotDiff {
             .filter(|a| {
                 matches!(
                     a,
-                    RestoreAction::MoveToWorkspace { .. } | RestoreAction::ToggleFloating { .. }
+                    RestoreAction::MoveToWorkspace { .. }
+                        | RestoreAction::ToggleFloating { .. }
+                        | RestoreAction::RepositionFloating { .. }
+                        | RestoreAction::SetFullscreen { .. }
+                        | RestoreAction::SetPin { .. }
                 )
             })
             .count()
@@ -249,6 +282,10 @@ impl Snapshot {
             match matched {
                 Some(live_w) => {
                     matched_live.insert(live_w.address.as_str());
+                    // Emit in restore order so apply_diff doesn't need to
+                    // resort: workspace → floating → geometry → fullscreen
+                    // → pin. Geometry and pin only meaningful when the
+                    // window will end up floating.
                     if live_w.workspace_id != snap.workspace_id {
                         actions.push(RestoreAction::MoveToWorkspace {
                             address: live_w.address.clone(),
@@ -260,6 +297,30 @@ impl Snapshot {
                         actions.push(RestoreAction::ToggleFloating {
                             address: live_w.address.clone(),
                             target: snap.floating,
+                        });
+                    }
+                    if snap.floating
+                        && (live_w.at != snap.at || live_w.size != snap.size)
+                    {
+                        actions.push(RestoreAction::RepositionFloating {
+                            address: live_w.address.clone(),
+                            target_at: snap.at,
+                            target_size: snap.size,
+                            current_at: live_w.at,
+                            current_size: live_w.size,
+                        });
+                    }
+                    if live_w.fullscreen != snap.fullscreen {
+                        actions.push(RestoreAction::SetFullscreen {
+                            address: live_w.address.clone(),
+                            from_mode: live_w.fullscreen,
+                            to_mode: snap.fullscreen,
+                        });
+                    }
+                    if snap.floating && live_w.pinned != snap.pinned {
+                        actions.push(RestoreAction::SetPin {
+                            address: live_w.address.clone(),
+                            target: snap.pinned,
                         });
                     }
                 }
@@ -342,9 +403,37 @@ pub async fn apply_diff(conn: &Connection, diff: &SnapshotDiff) -> Vec<ApplyOutc
             }
             RestoreAction::ToggleFloating { address, .. } => {
                 let sel = WindowSelector::Address(address.clone());
-                let result = conn
-                    .dispatch(&format!("togglefloating {}", sel.encode()))
+                let result = conn.toggle_floating_window(&sel).await;
+                outcomes.push(ApplyOutcome::from(action.clone(), result));
+            }
+            RestoreAction::RepositionFloating { address, target_at, target_size, .. } => {
+                let sel = WindowSelector::Address(address.clone());
+                let move_res = conn
+                    .move_window_pixel(&sel, target_at[0], target_at[1])
                     .await;
+                if let Err(e) = move_res {
+                    outcomes.push(ApplyOutcome {
+                        action: action.clone(),
+                        ok: false,
+                        skipped: false,
+                        error: Some(format!("move: {e}")),
+                    });
+                    continue;
+                }
+                let resize_res = conn
+                    .resize_window_pixel(&sel, target_size[0], target_size[1])
+                    .await;
+                outcomes.push(ApplyOutcome::from(action.clone(), resize_res));
+            }
+            RestoreAction::SetFullscreen { address, to_mode, .. } => {
+                let sel = WindowSelector::Address(address.clone());
+                // Set internal mode to target; leave external (-1) alone.
+                let result = conn.set_fullscreen_state(&sel, *to_mode, -1).await;
+                outcomes.push(ApplyOutcome::from(action.clone(), result));
+            }
+            RestoreAction::SetPin { address, .. } => {
+                let sel = WindowSelector::Address(address.clone());
+                let result = conn.pin_window(&sel).await;
                 outcomes.push(ApplyOutcome::from(action.clone(), result));
             }
             RestoreAction::WindowMissing { .. } | RestoreAction::WindowNotInSnapshot { .. } => {
