@@ -28,6 +28,14 @@ fn has_hyprland() -> bool {
     Instance::discover().is_ok()
 }
 
+fn has_grim() -> bool {
+    hyprpilot_vision::BackendAvailability::detect().has_grim()
+}
+
+fn has_tesseract() -> bool {
+    hyprpilot_vision::BackendAvailability::detect().has_tesseract()
+}
+
 fn temp_socket(suffix: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "hyprpilot-mcp-test-{}-{}.sock",
@@ -116,6 +124,18 @@ async fn tools_list_is_filtered_by_default_profile() {
     assert!(!names.contains(&"kill_active"), "default profile must hide kill_active");
     assert!(!names.contains(&"close_window"), "default profile must hide close_window");
     assert!(!names.contains(&"exec"), "default profile must hide exec");
+    for vision_tool in [
+        "screenshot",
+        "screenshot_region",
+        "screenshot_monitor",
+        "ocr_screen",
+        "ocr_region",
+    ] {
+        assert!(
+            !names.contains(&vision_tool),
+            "default profile must hide `{vision_tool}`"
+        );
+    }
 
     daemon.abort();
     let _ = std::fs::remove_file(&socket);
@@ -540,6 +560,144 @@ async fn snapshot_restore_dry_run_missing_snapshot_returns_invalid_params() {
     let _ = std::fs::remove_file(&socket);
     let _ = std::fs::remove_dir_all(&state_dir);
     std::env::remove_var("XDG_STATE_HOME");
+}
+
+#[tokio::test]
+async fn vision_tools_hidden_from_default_profile() {
+    if !has_hyprland() {
+        eprintln!("skip: no Hyprland");
+        return;
+    }
+    let socket = temp_socket("vision-hidden");
+    let _ = std::fs::remove_file(&socket);
+    let daemon = start_daemon(socket.clone()).await;
+
+    let mut server = Server::new(Profile::default_safe(), socket.clone());
+    let resp = server
+        .handle(req(60, "tools/list", json!({})))
+        .await
+        .expect("response");
+    let tools = resp.result.unwrap()["tools"]
+        .as_array()
+        .expect("tools array")
+        .clone();
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    for vision_tool in [
+        "screenshot",
+        "screenshot_region",
+        "screenshot_monitor",
+        "ocr_screen",
+        "ocr_region",
+    ] {
+        assert!(
+            !names.contains(&vision_tool),
+            "default profile must NOT expose `{vision_tool}`"
+        );
+    }
+
+    daemon.abort();
+    let _ = std::fs::remove_file(&socket);
+}
+
+#[tokio::test]
+async fn screenshot_region_returns_image_content() {
+    if !has_hyprland() {
+        eprintln!("skip: no Hyprland");
+        return;
+    }
+    if !has_grim() {
+        eprintln!("skip: no grim on PATH");
+        return;
+    }
+    let socket = temp_socket("vision-shot");
+    let _ = std::fs::remove_file(&socket);
+    let daemon = start_daemon(socket.clone()).await;
+
+    let mut server = Server::new(Profile::unrestricted(), socket.clone());
+    let resp = server
+        .handle(req(
+            70,
+            "tools/call",
+            json!({
+                "name": "screenshot_region",
+                "arguments": {"x": 0, "y": 0, "w": 64, "h": 64, "format": "png"}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(resp.error.is_none(), "JSON-RPC error: {:?}", resp.error);
+    let result = resp.result.expect("ok");
+    assert!(
+        !result["isError"].as_bool().unwrap_or(false),
+        "tool reported isError: content={:?}",
+        result["content"]
+    );
+    let block = &result["content"][0];
+    assert_eq!(block["type"].as_str(), Some("image"));
+    assert_eq!(block["mimeType"].as_str(), Some("image/png"));
+    let data = block["data"].as_str().expect("data field is a string");
+    assert!(!data.is_empty(), "base64 data must be non-empty");
+
+    use base64::Engine as _;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .expect("data must be valid base64");
+    assert!(decoded.len() >= 8, "decoded image too small: {}", decoded.len());
+    // PNG magic: 89 50 4E 47 0D 0A 1A 0A
+    assert_eq!(
+        &decoded[..8],
+        &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+        "expected PNG magic, got first bytes: {:02x?}",
+        &decoded[..8.min(decoded.len())]
+    );
+
+    daemon.abort();
+    let _ = std::fs::remove_file(&socket);
+}
+
+#[tokio::test]
+async fn ocr_region_returns_text_content() {
+    if !has_hyprland() {
+        eprintln!("skip: no Hyprland");
+        return;
+    }
+    if !has_grim() || !has_tesseract() {
+        eprintln!("skip: no grim/tesseract on PATH");
+        return;
+    }
+    let socket = temp_socket("vision-ocr");
+    let _ = std::fs::remove_file(&socket);
+    let daemon = start_daemon(socket.clone()).await;
+
+    let mut server = Server::new(Profile::unrestricted(), socket.clone());
+    // Pick a tiny region — likely blank or near-blank; tesseract returns
+    // an empty string in that case, which is success, not an error.
+    let resp = server
+        .handle(req(
+            71,
+            "tools/call",
+            json!({
+                "name": "ocr_region",
+                "arguments": {"x": 0, "y": 0, "w": 32, "h": 32}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(resp.error.is_none(), "JSON-RPC error: {:?}", resp.error);
+    let result = resp.result.expect("ok");
+    assert!(
+        !result["isError"].as_bool().unwrap_or(false),
+        "tool reported isError: content={:?}",
+        result["content"]
+    );
+    let block = &result["content"][0];
+    assert_eq!(block["type"].as_str(), Some("text"));
+    // Text may be empty or have a few stray glyphs; either is fine. We
+    // just need a string field.
+    assert!(block["text"].is_string(), "text block must contain a string");
+
+    daemon.abort();
+    let _ = std::fs::remove_file(&socket);
 }
 
 #[tokio::test]

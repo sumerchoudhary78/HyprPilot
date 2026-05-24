@@ -19,6 +19,7 @@ use tracing::{debug, error, warn};
 use hyprpilot_core::snapshot::{RestoreAction, SnapshotDiff};
 use hyprpilot_daemon::client::{ClientError, DaemonClient};
 use hyprpilot_daemon::protocol::Request;
+use hyprpilot_vision::{GrimCapture, TesseractOcr};
 
 use crate::capability::Profile;
 use crate::protocol::{
@@ -26,7 +27,7 @@ use crate::protocol::{
     JsonRpcRequest, JsonRpcResponse, ListToolsResult, ServerCapabilities, ServerInfo, Tool,
     PROTOCOL_VERSION,
 };
-use crate::tools::{self, Dispatch, DispatchError, ToolDef};
+use crate::tools::{self, CaptureOp, Dispatch, DispatchError, OcrOp, ToolDef};
 
 pub struct Server {
     profile: Profile,
@@ -209,6 +210,8 @@ impl Server {
             Dispatch::PreviewSnapshotRestore { name } => {
                 self.preview_snapshot_restore(id, name).await
             }
+            Dispatch::Capture(op) => handle_capture(id, op).await,
+            Dispatch::Ocr(op) => handle_ocr(id, op).await,
         }
     }
 
@@ -459,6 +462,73 @@ fn render_restore_preview(name: &str, diff: &SnapshotDiff) -> String {
     }
     out.push_str("\nPass `dry_run: false` to apply.");
     out
+}
+
+/// Run a capture op and wrap the bytes in an MCP `image` content block.
+/// Vision-backend errors surface as `isError` content, mirroring how
+/// `forward` reports daemon failures.
+async fn handle_capture(id: Value, op: CaptureOp) -> JsonRpcResponse {
+    let cap = match GrimCapture::detect() {
+        Ok(c) => c,
+        Err(e) => return tool_error(id, ErrorCode::ToolExecution, e.to_string()),
+    };
+    let (bytes_res, mime) = match op {
+        CaptureOp::Full { monitor, cursor, format } => {
+            let cap = cap.with_cursor(cursor);
+            (cap.full(monitor.as_deref(), format).await, format.mime())
+        }
+        CaptureOp::Region { region, cursor, format } => {
+            let cap = cap.with_cursor(cursor);
+            (cap.region(region, format).await, format.mime())
+        }
+    };
+    match bytes_res {
+        Ok(bytes) => JsonRpcResponse::ok(
+            id,
+            CallToolResult {
+                content: vec![Content::image(&bytes, mime)],
+                is_error: false,
+            },
+        ),
+        Err(e) => tool_error(id, ErrorCode::ToolExecution, e.to_string()),
+    }
+}
+
+/// Run an OCR op: capture, then extract text. Returns a `text` content
+/// block. The OCR backend treats "no recognizable text" as `Ok("")` (not an
+/// error), so an empty string is a legitimate success result.
+async fn handle_ocr(id: Value, op: OcrOp) -> JsonRpcResponse {
+    let cap = match GrimCapture::detect() {
+        Ok(c) => c,
+        Err(e) => return tool_error(id, ErrorCode::ToolExecution, e.to_string()),
+    };
+    let (bytes_res, lang, psm) = match op {
+        OcrOp::Screen { lang, psm } => (
+            cap.full(None, hyprpilot_vision::ImageFormat::Png).await,
+            lang,
+            psm,
+        ),
+        OcrOp::Region { region, lang, psm } => (
+            cap.region(region, hyprpilot_vision::ImageFormat::Png).await,
+            lang,
+            psm,
+        ),
+    };
+    let bytes = match bytes_res {
+        Ok(b) => b,
+        Err(e) => return tool_error(id, ErrorCode::ToolExecution, e.to_string()),
+    };
+    let ocr = match TesseractOcr::detect() {
+        Ok(o) => o.with_lang(lang).with_psm(psm),
+        Err(e) => return tool_error(id, ErrorCode::ToolExecution, e.to_string()),
+    };
+    match ocr.extract_text(&bytes).await {
+        Ok(text) => JsonRpcResponse::ok(
+            id,
+            CallToolResult { content: vec![Content::text(text)], is_error: false },
+        ),
+        Err(e) => tool_error(id, ErrorCode::ToolExecution, e.to_string()),
+    }
 }
 
 fn classify_daemon_error(e: &ClientError) -> (ErrorCode, String) {
