@@ -277,6 +277,13 @@ async fn handle_request(state: &State, req: Request) -> Response {
         Request::SnapshotDiff { name } => snapshot_diff(state, name).await,
         Request::SnapshotRestore { name } => snapshot_restore(state, name).await,
         Request::SnapshotDelete { name } => snapshot_delete(name),
+
+        // ---- rules ---------------------------------------------------------
+        Request::RulesList => rules_list(),
+        Request::RulesValidate => rules_validate(),
+        Request::RulesPath => Response::ok(serde_json::json!({
+            "path": crate::rules::default_path(),
+        })),
     }
 }
 
@@ -500,6 +507,51 @@ fn snapshot_delete(name: String) -> Response {
     match delete_named(&name) {
         Ok(()) => Response::ok(serde_json::json!({ "deleted": name })),
         Err(e) => Response::err(codes::SNAPSHOT_IO, e.to_string()),
+    }
+}
+
+fn rules_list() -> Response {
+    match crate::rules::load_default() {
+        Ok(Some(cfg)) => Response::ok(serde_json::json!({
+            "path": crate::rules::default_path(),
+            "count": cfg.len(),
+            "rules": cfg.rules,
+        })),
+        Ok(None) => Response::ok(serde_json::json!({
+            "path": crate::rules::default_path(),
+            "count": 0,
+            "rules": [],
+        })),
+        Err(e) => Response::err(codes::RULES_LOAD_FAILED, e.to_string()),
+    }
+}
+
+fn rules_validate() -> Response {
+    let path = crate::rules::default_path();
+    let cfg = match crate::rules::load_default() {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return Response::ok(serde_json::json!({
+                "ok": true,
+                "path": path,
+                "rules": 0,
+                "note": "no rules file present",
+            }));
+        }
+        Err(e) => {
+            return Response::err(codes::RULES_LOAD_FAILED, e.to_string());
+        }
+    };
+    match crate::engine::compile(&cfg) {
+        Ok(compiled) => Response::ok(serde_json::json!({
+            "ok": true,
+            "path": path,
+            "rules": compiled.len(),
+        })),
+        Err(msg) => Response::err(
+            codes::RULES_LOAD_FAILED,
+            format!("rules compile error: {msg}"),
+        ),
     }
 }
 
