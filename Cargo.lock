@@ -167,6 +167,7 @@ dependencies = [
  "clap",
  "hyprpilot-core",
  "hyprpilot-daemon",
+ "hyprpilot-input",
  "serde",
  "serde_json",
  "tokio",
@@ -192,6 +193,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hyprpilot-core",
+ "hyprpilot-input",
  "serde",
  "serde_json",
  "thiserror",
@@ -202,6 +204,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprpilot-input"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "hyprpilot-mcp"
 version = "0.1.0"
 dependencies = [
@@ -209,6 +221,7 @@ dependencies = [
  "clap",
  "hyprpilot-core",
  "hyprpilot-daemon",
+ "hyprpilot-input",
  "schemars",
  "serde",
  "serde_json",

@@ -1,0 +1,25 @@
+# HyprPilot capability profile that enables the input synthesis tools.
+#
+# Save to: $XDG_CONFIG_HOME/hyprpilot/profiles/<name>.toml
+# (typically ~/.config/hyprpilot/profiles/<name>.toml)
+#
+# Run the MCP server with:
+#   hyprpilot-mcp --profile <name>
+#
+# Reminder — input synthesis ALSO requires HYPRPILOT_DANGEROUS_INPUT_OK=1
+# in the daemon's environment. Two independent gates because input is
+# uniquely dangerous (an agent that can type can run shell commands in
+# any focused terminal).
+
+# Allow everything the default profile allows, plus the input group.
+allow = ["read", "window", "workspace", "undo", "snapshot", "rules", "input"]
+
+# Optional: keep the most dangerous parts of the input surface off even
+# when the rest of input is enabled. The CLI / MCP layer dispatches by
+# tool name, so deny_tools is the right knob.
+deny_tools = [
+    # Free-form typing is the riskiest input verb — it can run shell in
+    # any focused terminal. Uncomment to keep the rest of input but lock
+    # this one down.
+    # "input_type",
+]

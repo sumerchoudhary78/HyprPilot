@@ -9,6 +9,7 @@ use hyprpilot_core::dispatch::{Direction, FullscreenMode};
 use hyprpilot_core::selector::{WindowSelector, WorkspaceRef};
 use hyprpilot_core::Connection;
 use hyprpilot_daemon::{client::DaemonClient, default_socket_path, protocol::Request};
+use hyprpilot_input::keys::{KeyCombo, MouseButton};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -63,6 +64,48 @@ enum Cmd {
     /// Declarative event-to-action rules.
     #[command(subcommand)]
     Rules(RulesCmd),
+    /// Input synthesis: typing, key chords, mouse. Disabled by default
+    /// in the daemon; requires HYPRPILOT_DANGEROUS_INPUT_OK=1 in the
+    /// daemon's environment.
+    #[command(subcommand)]
+    Input(InputCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum InputCmd {
+    /// Type free-form text into the focused window (via wtype).
+    Type {
+        /// Text to type. Use `--` to pass text that begins with `-`.
+        #[arg(trailing_var_arg = true, required = true)]
+        text: Vec<String>,
+    },
+    /// Press a key chord in the focused window (via wtype).
+    Keys {
+        /// e.g. `ctrl+shift+t`, `super+space`, `Escape`.
+        combo: String,
+    },
+    /// Send a key chord to a specific window (via Hyprland sendshortcut;
+    /// no external backend, no focus change).
+    Shortcut {
+        /// Key chord, e.g. `ctrl+t`.
+        combo: String,
+        /// Window selector: `active`, `class:Foo`, `pid:1234`, etc.
+        target: String,
+    },
+    /// Move the mouse cursor (via ydotool).
+    MouseMove {
+        x: i32,
+        y: i32,
+        /// Interpret (x, y) as absolute screen coordinates rather than a
+        /// delta from the current cursor position.
+        #[arg(short, long)]
+        absolute: bool,
+    },
+    /// Click a mouse button (via ydotool).
+    MouseClick {
+        /// `left`, `right`, `middle`, `x1`/`back`, `x2`/`forward`.
+        button: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -261,7 +304,32 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Snapshot(s) => run_snapshot_cmd(s, cli.daemon_socket.as_deref(), cli.json).await,
         Cmd::Rules(r) => run_rules_cmd(r, cli.daemon_socket.as_deref(), cli.json).await,
+        Cmd::Input(i) => run_input_cmd(i, cli.daemon_socket.as_deref(), cli.json).await,
     }
+}
+
+async fn run_input_cmd(
+    i: InputCmd,
+    socket: Option<&std::path::Path>,
+    json: bool,
+) -> Result<()> {
+    let mut client = open_daemon(socket).await?;
+    let req = match i {
+        InputCmd::Type { text } => Request::InputType { text: text.join(" ") },
+        InputCmd::Keys { combo } => Request::InputKeys {
+            combo: KeyCombo::parse(&combo).map_err(|e| anyhow!(e))?,
+        },
+        InputCmd::Shortcut { combo, target } => Request::InputShortcut {
+            combo: KeyCombo::parse(&combo).map_err(|e| anyhow!(e))?,
+            selector: hyprpilot_core::WindowSelector::parse(&target).map_err(|e| anyhow!(e))?,
+        },
+        InputCmd::MouseMove { x, y, absolute } => Request::InputMouseMove { x, y, absolute },
+        InputCmd::MouseClick { button } => Request::InputMouseClick {
+            button: MouseButton::parse(&button).map_err(|e| anyhow!(e))?,
+        },
+    };
+    let v: serde_json::Value = client.call(req).await?;
+    emit_json_or_text(json, &v, &pretty(&v))
 }
 
 async fn run_rules_cmd(

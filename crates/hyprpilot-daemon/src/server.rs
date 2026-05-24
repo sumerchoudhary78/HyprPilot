@@ -19,6 +19,8 @@ use hyprpilot_core::dispatch::FullscreenMode;
 use hyprpilot_core::selector::{WindowSelector, WorkspaceRef};
 use hyprpilot_core::types::Client as HyprClient;
 use hyprpilot_core::{Connection, Error as CoreError};
+use hyprpilot_input::keys::{KeyCombo, MouseButton};
+use hyprpilot_input::{InputError, InputRunner};
 
 use crate::protocol::{
     codes, Request, RequestEnvelope, Response, ResponseEnvelope, UndoListEntry,
@@ -34,6 +36,10 @@ struct State {
     hypr: Connection,
     undo: Arc<Mutex<UndoStack>>,
     shutdown: Arc<Notify>,
+    /// True when HYPRPILOT_DANGEROUS_INPUT_OK=1 was set at startup.
+    /// Input dispatchers refuse on false with `input_disabled`.
+    input_enabled: bool,
+    input_runner: Arc<InputRunner>,
 }
 
 pub async fn run(socket_path: PathBuf) -> AnyResult<()> {
@@ -81,10 +87,33 @@ pub async fn run(socket_path: PathBuf) -> AnyResult<()> {
         ),
     }
 
+    // Input subsystem. Gated by an explicit env var because input
+    // synthesis is uniquely dangerous: any focused terminal executes
+    // typed shell commands. The gate is checked once at startup; per
+    // request the daemon just consults state.input_enabled.
+    let input_enabled = std::env::var("HYPRPILOT_DANGEROUS_INPUT_OK")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let input_runner = Arc::new(InputRunner::detect());
+    if input_enabled {
+        info!(
+            wtype = ?input_runner.backends().wtype,
+            ydotool = ?input_runner.backends().ydotool,
+            "input synthesis ENABLED (HYPRPILOT_DANGEROUS_INPUT_OK=1)"
+        );
+    } else {
+        info!(
+            "input synthesis DISABLED \
+             (set HYPRPILOT_DANGEROUS_INPUT_OK=1 in the daemon's env to enable)"
+        );
+    }
+
     let state = State {
         hypr,
         undo: Arc::new(Mutex::new(undo_stack)),
         shutdown: Arc::new(Notify::new()),
+        input_enabled,
+        input_runner,
     };
 
     // Rules engine. Loads $XDG_CONFIG_HOME/hyprpilot/rules.toml if present;
@@ -284,6 +313,104 @@ async fn handle_request(state: &State, req: Request) -> Response {
         Request::RulesPath => Response::ok(serde_json::json!({
             "path": crate::rules::default_path(),
         })),
+
+        // ---- input ---------------------------------------------------------
+        Request::InputType { text } => input_type(state, text).await,
+        Request::InputKeys { combo } => input_keys(state, combo).await,
+        Request::InputShortcut { combo, selector } => {
+            input_shortcut(state, combo, selector).await
+        }
+        Request::InputMouseMove { x, y, absolute } => {
+            input_mouse_move(state, x, y, absolute).await
+        }
+        Request::InputMouseClick { button } => input_mouse_click(state, button).await,
+    }
+}
+
+fn input_disabled_response() -> Response {
+    Response::err(
+        codes::INPUT_DISABLED,
+        "input synthesis is disabled in this daemon. \
+         Restart the daemon with HYPRPILOT_DANGEROUS_INPUT_OK=1 to enable.",
+    )
+}
+
+fn input_error_response(e: InputError) -> Response {
+    let code = match &e {
+        InputError::BackendMissing(_) => codes::INPUT_BACKEND_MISSING,
+        InputError::InvalidCombo(_) | InputError::InvalidButton(_) => codes::INPUT_INVALID,
+        InputError::BackendFailed { .. } => codes::INPUT_FAILED,
+        InputError::Io(_) => codes::INPUT_FAILED,
+    };
+    Response::err(code, e.to_string())
+}
+
+async fn input_type(state: &State, text: String) -> Response {
+    if !state.input_enabled {
+        return input_disabled_response();
+    }
+    match state.input_runner.type_text(&text).await {
+        Ok(()) => Response::ok(serde_json::json!({ "typed_bytes": text.len() })),
+        Err(e) => input_error_response(e),
+    }
+}
+
+async fn input_keys(state: &State, combo: KeyCombo) -> Response {
+    if !state.input_enabled {
+        return input_disabled_response();
+    }
+    let label = combo.to_string();
+    match state.input_runner.press_keys(&combo).await {
+        Ok(()) => Response::ok(serde_json::json!({ "pressed": label })),
+        Err(e) => input_error_response(e),
+    }
+}
+
+async fn input_shortcut(
+    state: &State,
+    combo: KeyCombo,
+    selector: WindowSelector,
+) -> Response {
+    if !state.input_enabled {
+        return input_disabled_response();
+    }
+    // No external backend — Hyprland's sendshortcut takes a selector
+    // directly. Build: `sendshortcut MODS,KEY,SELECTOR`.
+    let mods = combo.encode_hyprctl_mods();
+    let payload = format!(
+        "sendshortcut {mods},{key},{sel}",
+        key = combo.key,
+        sel = selector.encode()
+    );
+    match state.hypr.dispatch(&payload).await {
+        Ok(()) => Response::ok(serde_json::json!({
+            "sent": combo.to_string(),
+            "target": selector.encode(),
+        })),
+        Err(e) => core_error(e),
+    }
+}
+
+async fn input_mouse_move(state: &State, x: i32, y: i32, absolute: bool) -> Response {
+    if !state.input_enabled {
+        return input_disabled_response();
+    }
+    match state.input_runner.mouse_move(x, y, absolute).await {
+        Ok(()) => Response::ok(serde_json::json!({
+            "moved_to": [x, y],
+            "absolute": absolute,
+        })),
+        Err(e) => input_error_response(e),
+    }
+}
+
+async fn input_mouse_click(state: &State, button: MouseButton) -> Response {
+    if !state.input_enabled {
+        return input_disabled_response();
+    }
+    match state.input_runner.mouse_click(button).await {
+        Ok(()) => Response::ok(serde_json::json!({ "clicked": button })),
+        Err(e) => input_error_response(e),
     }
 }
 
