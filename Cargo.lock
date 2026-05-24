@@ -221,6 +221,7 @@ dependencies = [
  "clap",
  "hyprpilot-core",
  "hyprpilot-daemon",
+ "hyprpilot-input",
  "schemars",
  "serde",
  "serde_json",

@@ -44,6 +44,10 @@ pub enum ToolGroup {
     Snapshot,
     /// Inspect and validate the daemon's declarative rules config.
     Rules,
+    /// Input synthesis: typing, key chords, mouse. DANGEROUS — agent
+    /// can run arbitrary shell commands in any focused terminal.
+    /// NOT in the default profile; daemon-side env-var gate also applies.
+    Input,
 }
 
 impl ToolGroup {
@@ -57,6 +61,7 @@ impl ToolGroup {
             ToolGroup::Undo => "undo",
             ToolGroup::Snapshot => "snapshot",
             ToolGroup::Rules => "rules",
+            ToolGroup::Input => "input",
         }
     }
 }
@@ -103,6 +108,7 @@ impl Profile {
             ToolGroup::Undo,
             ToolGroup::Snapshot,
             ToolGroup::Rules,
+            ToolGroup::Input,
         ] {
             allow.insert(g);
         }

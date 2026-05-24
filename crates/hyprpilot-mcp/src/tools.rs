@@ -26,6 +26,7 @@ use serde_json::Value;
 use hyprpilot_core::dispatch::{Direction, FullscreenMode};
 use hyprpilot_core::selector::{WindowSelector, WorkspaceRef};
 use hyprpilot_daemon::protocol::Request;
+use hyprpilot_input::keys::{KeyCombo, MouseButton};
 
 use crate::capability::ToolGroup;
 
@@ -218,6 +219,70 @@ pub struct SnapshotNameArgs {
     /// Snapshot name. Allowed chars: `[A-Za-z0-9_.-]+`, must not start with
     /// `.`, max 128 chars.
     pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct InputTextArgs {
+    /// Free-form text to type into the focused window. Whatever is
+    /// currently focused will receive this — verify with
+    /// `query_active_window` first if you're not sure.
+    pub text: String,
+    /// When true (default), do not modify Hyprland; return a preview only.
+    /// Pass `false` to actually apply the change.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct InputKeysArgs {
+    /// Key chord, e.g. `ctrl+shift+t`, `super+space`, `Escape`.
+    /// Modifiers: ctrl, shift, alt, super (aliases: control, meta, cmd,
+    /// win, mod4). Last token is the keysym (passed to wtype as-is).
+    pub combo: String,
+    /// When true (default), do not modify Hyprland; return a preview only.
+    /// Pass `false` to actually apply the change.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct InputShortcutArgs {
+    /// Key chord, e.g. `ctrl+t`.
+    pub combo: String,
+    /// Window selector: `active`, `class:Foo`, `pid:1234`, `title:Foo`,
+    /// `address:0x<hex>`, or `tag:<name>`.
+    pub selector: String,
+    /// When true (default), do not modify Hyprland; return a preview only.
+    /// Pass `false` to actually apply the change.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct InputMouseMoveArgs {
+    /// X coordinate (pixels). Absolute screen-space if `absolute=true`,
+    /// otherwise a delta from the current cursor position.
+    pub x: i32,
+    /// Y coordinate (pixels). Same semantics as x.
+    pub y: i32,
+    /// When true, (x, y) are absolute screen coordinates.
+    /// When false (default), they are deltas from the current cursor.
+    #[serde(default)]
+    pub absolute: bool,
+    /// When true (default), do not modify Hyprland; return a preview only.
+    /// Pass `false` to actually apply the change.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct InputMouseClickArgs {
+    /// `left`, `right`, `middle`, `x1`/`back`, `x2`/`forward`.
+    pub button: String,
+    /// When true (default), do not modify Hyprland; return a preview only.
+    /// Pass `false` to actually apply the change.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -518,6 +583,54 @@ pub fn registry() -> Vec<ToolDef> {
              Useful for opening the file in an editor without guessing \
              the XDG resolution. Read-only.",
         ),
+        // ---- Input (group: input) — NOT in default profile ------------------
+        def::<InputTextArgs>(
+            "input_type",
+            Input,
+            true,
+            "Type free-form text into the focused window via wtype. \
+             VERY DANGEROUS: any focused terminal will execute the typed \
+             text as shell commands. Verify the focused window with \
+             `query_active_window` before applying. Daemon requires \
+             HYPRPILOT_DANGEROUS_INPUT_OK=1; this tool also requires the \
+             `input` capability group, which is NOT in the default profile.",
+        ),
+        def::<InputKeysArgs>(
+            "input_keys",
+            Input,
+            true,
+            "Press a key chord in the focused window (e.g. `ctrl+shift+t`). \
+             Uses wtype, so the chord goes wherever focus is. Same safety \
+             gates as `input_type`.",
+        ),
+        def::<InputShortcutArgs>(
+            "input_shortcut",
+            Input,
+            true,
+            "Send a key chord to a specific window via Hyprland's \
+             sendshortcut dispatcher. Does not require wtype and does not \
+             change focus — the target window receives the chord even if \
+             it is hidden on another workspace. Safer than `input_keys` \
+             because it cannot accidentally fire in a terminal you didn't \
+             mean, but still subject to the same capability + env-var gates.",
+        ),
+        def::<InputMouseMoveArgs>(
+            "input_mouse_move",
+            Input,
+            true,
+            "Move the mouse cursor via ydotool. With `absolute=true`, moves \
+             to screen coordinates (x, y); otherwise moves by delta. \
+             Requires ydotoold running with input-device access. Same \
+             capability + env-var gates as the rest of the input surface.",
+        ),
+        def::<InputMouseClickArgs>(
+            "input_mouse_click",
+            Input,
+            true,
+            "Click a mouse button at the current cursor position via \
+             ydotool. Button names: left, right, middle, x1/back, \
+             x2/forward. Same gates as input_mouse_move.",
+        ),
     ]
 }
 
@@ -678,7 +791,91 @@ pub fn dispatch(name: &str, args: Value) -> Result<Dispatch, DispatchError> {
         "rules_validate" => parse_no_args(name, args, Request::RulesValidate),
         "rules_path" => parse_no_args(name, args, Request::RulesPath),
 
+        // ---- input ---------------------------------------------------------
+        "input_type" => {
+            let p: InputTextArgs = parse_args(name, args)?;
+            let preview_text = p.text.clone();
+            forward_or_preview(
+                p.dry_run,
+                Request::InputType { text: p.text },
+                || {
+                    format!(
+                        "would type {} bytes into the focused window: {:?}",
+                        preview_text.len(),
+                        truncate(&preview_text, 80),
+                    )
+                },
+            )
+        }
+        "input_keys" => {
+            let p: InputKeysArgs = parse_args(name, args)?;
+            let combo = parse_combo(name, &p.combo)?;
+            let combo_label = combo.to_string();
+            forward_or_preview(
+                p.dry_run,
+                Request::InputKeys { combo },
+                || format!("would press `{combo_label}` in the focused window"),
+            )
+        }
+        "input_shortcut" => {
+            let p: InputShortcutArgs = parse_args(name, args)?;
+            let combo = parse_combo(name, &p.combo)?;
+            let selector = WindowSelector::parse(&p.selector).map_err(|e| {
+                DispatchError::InvalidArgs { tool: name.to_string(), message: e }
+            })?;
+            let combo_label = combo.to_string();
+            let sel_label = p.selector.clone();
+            forward_or_preview(
+                p.dry_run,
+                Request::InputShortcut { combo, selector },
+                || format!("would send `{combo_label}` to `{sel_label}`"),
+            )
+        }
+        "input_mouse_move" => {
+            let p: InputMouseMoveArgs = parse_args(name, args)?;
+            forward_or_preview(
+                p.dry_run,
+                Request::InputMouseMove { x: p.x, y: p.y, absolute: p.absolute },
+                || {
+                    let mode = if p.absolute { "to absolute" } else { "by delta" };
+                    format!("would move mouse {mode} ({}, {})", p.x, p.y)
+                },
+            )
+        }
+        "input_mouse_click" => {
+            let p: InputMouseClickArgs = parse_args(name, args)?;
+            let button = MouseButton::parse(&p.button).map_err(|e| {
+                DispatchError::InvalidArgs { tool: name.to_string(), message: e.to_string() }
+            })?;
+            let label = format!("{button:?}");
+            forward_or_preview(
+                p.dry_run,
+                Request::InputMouseClick { button },
+                || format!("would click {label} at current cursor position"),
+            )
+        }
+
         other => Err(DispatchError::UnknownTool(other.to_string())),
+    }
+}
+
+fn parse_combo(tool: &str, s: &str) -> Result<KeyCombo, DispatchError> {
+    KeyCombo::parse(s).map_err(|e| DispatchError::InvalidArgs {
+        tool: tool.to_string(),
+        message: e.to_string(),
+    })
+}
+
+fn truncate(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        s
+    } else {
+        // Find a char boundary at or before `max`.
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
     }
 }
 
@@ -792,7 +989,43 @@ mod tests {
     fn registry_count() {
         // Lock the surface so additions are deliberate. Update this number
         // intentionally when adding/removing tools.
-        assert_eq!(registry().len(), 35);
+        assert_eq!(registry().len(), 40);
+    }
+
+    #[test]
+    fn input_tools_are_in_input_group() {
+        let reg = registry();
+        for name in [
+            "input_type",
+            "input_keys",
+            "input_shortcut",
+            "input_mouse_move",
+            "input_mouse_click",
+        ] {
+            let t = reg
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("missing tool `{name}` in registry"));
+            assert_eq!(t.group, crate::capability::ToolGroup::Input);
+            assert!(t.mutating, "input tool `{name}` must be flagged mutating");
+        }
+    }
+
+    #[test]
+    fn default_profile_does_not_include_input_tools() {
+        let p = crate::capability::Profile::default_safe();
+        for name in [
+            "input_type",
+            "input_keys",
+            "input_shortcut",
+            "input_mouse_move",
+            "input_mouse_click",
+        ] {
+            assert!(
+                !p.allows(name, crate::capability::ToolGroup::Input),
+                "default profile must NOT permit `{name}`"
+            );
+        }
     }
 
     #[test]
