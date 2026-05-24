@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use hyprpilot_core::dispatch::{Direction, FullscreenMode};
 use hyprpilot_core::selector::{WindowSelector, WorkspaceRef};
+use hyprpilot_input::keys::{KeyCombo, MouseButton};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestEnvelope {
@@ -83,6 +84,21 @@ pub enum Request {
     RulesValidate,
     /// Returns the on-disk path the daemon would load from.
     RulesPath,
+
+    /// Type free-form text into the focused window via wtype. DANGEROUS:
+    /// any focused terminal will execute typed shell commands. Gated by
+    /// HYPRPILOT_DANGEROUS_INPUT_OK=1 at daemon startup.
+    InputType { text: String },
+    /// Press a key combo in the focused window via wtype.
+    InputKeys { combo: KeyCombo },
+    /// Send a key combo to a specific window via Hyprland's sendshortcut.
+    /// Does not require wtype; does not change focus.
+    InputShortcut { combo: KeyCombo, selector: WindowSelector },
+    /// Move the mouse cursor via ydotool. absolute=true uses screen
+    /// coordinates; absolute=false moves by (x, y) delta.
+    InputMouseMove { x: i32, y: i32, absolute: bool },
+    /// Press + release a mouse button via ydotool.
+    InputMouseClick { button: MouseButton },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +138,15 @@ pub mod codes {
     pub const SNAPSHOT_INVALID_NAME: &str = "snapshot_invalid_name";
     pub const SNAPSHOT_IO: &str = "snapshot_io";
     pub const RULES_LOAD_FAILED: &str = "rules_load_failed";
+    /// Input synthesis is gated by HYPRPILOT_DANGEROUS_INPUT_OK=1; the
+    /// daemon was started without it.
+    pub const INPUT_DISABLED: &str = "input_disabled";
+    /// Required external backend (wtype, ydotool) is not installed.
+    pub const INPUT_BACKEND_MISSING: &str = "input_backend_missing";
+    /// Input arguments were invalid (bad combo, bad button name).
+    pub const INPUT_INVALID: &str = "input_invalid";
+    /// Backend ran but exited non-zero.
+    pub const INPUT_FAILED: &str = "input_failed";
     pub const INTERNAL: &str = "internal";
 }
 

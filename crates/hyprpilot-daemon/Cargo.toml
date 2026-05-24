@@ -16,6 +16,7 @@ path = "src/bin/daemon.rs"
 
 [dependencies]
 hyprpilot-core = { workspace = true }
+hyprpilot-input = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

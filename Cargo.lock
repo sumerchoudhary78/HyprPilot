@@ -192,6 +192,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hyprpilot-core",
+ "hyprpilot-input",
  "serde",
  "serde_json",
  "thiserror",
