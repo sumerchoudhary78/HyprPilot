@@ -10,6 +10,7 @@
 
 pub mod client;
 pub mod protocol;
+pub mod rules;
 pub mod server;
 pub mod socket;
 pub mod undo;
