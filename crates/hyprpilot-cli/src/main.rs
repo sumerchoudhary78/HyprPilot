@@ -142,17 +142,17 @@ enum WinCmd {
 enum WsCmd {
     /// Switch to a workspace.
     Switch {
-        #[arg(value_parser = parse_workspace_ref)]
+        #[arg(value_parser = parse_workspace_ref, allow_hyphen_values = true)]
         target: WorkspaceRef,
     },
     /// Send the focused window to a workspace and follow it.
     Send {
-        #[arg(value_parser = parse_workspace_ref)]
+        #[arg(value_parser = parse_workspace_ref, allow_hyphen_values = true)]
         target: WorkspaceRef,
     },
     /// Send the focused window silently (no focus change).
     SendSilent {
-        #[arg(value_parser = parse_workspace_ref)]
+        #[arg(value_parser = parse_workspace_ref, allow_hyphen_values = true)]
         target: WorkspaceRef,
     },
     /// Move the focused workspace to a named monitor.
@@ -488,4 +488,66 @@ fn emit_json_or_text(json: bool, v: &serde_json::Value, text: &str) -> Result<()
 
 fn pretty(v: &serde_json::Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negative_relative_workspace_parses_as_value_not_flag() {
+        // Regression for issue #11: `ws switch -1` used to fail clap parsing
+        // because clap treated `-1` as a short flag.
+        let cli = Cli::parse_from(["hyprpilot", "ws", "switch", "-1"]);
+        match cli.cmd {
+            Cmd::Ws(WsCmd::Switch { target }) => {
+                assert_eq!(target, WorkspaceRef::Relative(-1));
+            }
+            other => panic!("expected Ws Switch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negative_relative_workspace_parses_for_send() {
+        let cli = Cli::parse_from(["hyprpilot", "ws", "send", "-1"]);
+        match cli.cmd {
+            Cmd::Ws(WsCmd::Send { target }) => {
+                assert_eq!(target, WorkspaceRef::Relative(-1));
+            }
+            other => panic!("expected Ws Send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negative_relative_workspace_parses_for_send_silent() {
+        let cli = Cli::parse_from(["hyprpilot", "ws", "send-silent", "-1"]);
+        match cli.cmd {
+            Cmd::Ws(WsCmd::SendSilent { target }) => {
+                assert_eq!(target, WorkspaceRef::Relative(-1));
+            }
+            other => panic!("expected Ws SendSilent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn positive_relative_workspace_still_parses() {
+        let cli = Cli::parse_from(["hyprpilot", "ws", "switch", "+1"]);
+        match cli.cmd {
+            Cmd::Ws(WsCmd::Switch { target }) => {
+                assert_eq!(target, WorkspaceRef::Relative(1));
+            }
+            other => panic!("expected Ws Switch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn absolute_workspace_id_still_parses() {
+        let cli = Cli::parse_from(["hyprpilot", "ws", "switch", "2"]);
+        match cli.cmd {
+            Cmd::Ws(WsCmd::Switch { target }) => {
+                assert_eq!(target, WorkspaceRef::Id(2));
+            }
+            other => panic!("expected Ws Switch, got {other:?}"),
+        }
+    }
 }
