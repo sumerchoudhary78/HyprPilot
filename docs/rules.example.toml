@@ -1,0 +1,95 @@
+# Example HyprPilot rules config.
+#
+# Copy to $XDG_CONFIG_HOME/hyprpilot/rules.toml (typically
+# ~/.config/hyprpilot/rules.toml) and restart the daemon to load.
+#
+# Validate without restarting:
+#   hyprpilot rules validate
+# Or via MCP:
+#   tools/call name=rules_validate
+#
+# ## Semantics
+#
+# - **First match wins.** Rules are evaluated top-to-bottom; the first
+#   one whose `on` matches the incoming event's kind and whose `when`
+#   predicates all hold against the event's fields fires its `do` actions.
+# - **Equality predicates only.** v0.4 doesn't support regex, ranges, or
+#   negation. An empty `when = {}` matches any event of the same `on`.
+# - **Reentrance protected.** While the engine is executing a rule's
+#   actions, incoming events (including the echoes from the dispatchers
+#   just fired) are skipped for matching, with a short tail (~100 ms)
+#   after the actions finish.
+#
+# ## Field reference
+#
+# See crates/hyprpilot-core/src/events.rs for the full set. Common
+# fields per `on`:
+#
+#   openwindow          -> address, workspace, class, title
+#   closewindow         -> address
+#   movewindow          -> address, workspace
+#   movewindowv2        -> address, workspace_id, workspace
+#   windowtitle         -> address
+#   windowtitlev2       -> address, title
+#   activewindow        -> class, title
+#   activewindowv2      -> address
+#   workspace           -> name
+#   workspacev2         -> id, name
+#   focusedmon          -> monitor, workspace
+#   fullscreen          -> state ("0" or "1")
+#   changefloatingmode  -> address, floating ("0" or "1")
+#   monitoradded(v2)    -> name [, id, description]
+#   monitorremoved      -> name
+#   submap              -> name
+#   pin                 -> address, state
+#
+# ## Action grammar
+#
+# Each `do` entry is `verb [args...]`, where the verb matches one of:
+#
+#   focus_window <selector>
+#   close_window <selector>
+#   kill_active
+#   cycle_next | cycle_prev
+#   switch_workspace <workspace>
+#   move_to_workspace <workspace>
+#   move_to_workspace_silent <workspace>
+#   toggle_floating
+#   fullscreen <0|1|maximize|fullscreen>
+#   center_active
+#   pin
+#   move_active <l|r|u|d>
+#   swap_active <l|r|u|d>
+#   resize_active <dx> <dy>
+#   exec <shell-command>
+#   focus_monitor <name-or-direction>
+#   move_workspace_to_monitor <name>
+#
+# Selectors: `active`, `class:Foo`, `pid:1234`, `title:Foo`,
+# `address:0x<hex>`. Workspaces: `2`, `+1`, `prev`, `next`, `empty`,
+# `name:foo`, `special:term`.
+
+# Slack always opens on the scratchpad.
+[[rule]]
+name = "slack to scratchpad"
+on = "openwindow"
+when = { class = "Slack" }
+do = ["move_to_workspace_silent special:scratch"]
+
+# Spotify is floating + pinned.
+[[rule]]
+name = "spotify floating pinned"
+on = "openwindow"
+when = { class = "Spotify" }
+do = ["toggle_floating", "pin"]
+
+# When a new monitor appears, jump focus to it.
+[[rule]]
+on = "monitoradded"
+do = ["focus_monitor r"]
+
+# When entering submap "resize", do nothing but log via exec.
+[[rule]]
+on = "submap"
+when = { name = "resize" }
+do = ["exec notify-send 'submap: resize'"]
