@@ -742,6 +742,134 @@ mod tests {
     }
 
     #[test]
+    fn diff_floating_geometry_changed_emits_reposition() {
+        let mut target_w = win("0xa", 1, true);
+        target_w.at = [100, 200];
+        target_w.size = [800, 600];
+        let mut live_w = win("0xa", 1, true);
+        live_w.at = [0, 0];
+        live_w.size = [400, 300];
+        let target = snap(vec![target_w]);
+        let live = snap(vec![live_w]);
+        let d = target.diff_against(&live);
+        assert!(d.actions.iter().any(|a| matches!(
+            a,
+            RestoreAction::RepositionFloating { target_at: [100, 200], target_size: [800, 600], .. }
+        )));
+    }
+
+    #[test]
+    fn diff_tiled_geometry_change_emits_no_reposition() {
+        // Geometry on tiled windows is layout-driven; reposition wouldn't
+        // help and would no-op against Hyprland. Diff must not emit it.
+        let mut target_w = win("0xa", 1, false);
+        target_w.at = [100, 200];
+        let mut live_w = win("0xa", 1, false);
+        live_w.at = [0, 0];
+        let target = snap(vec![target_w]);
+        let live = snap(vec![live_w]);
+        let d = target.diff_against(&live);
+        assert!(!d
+            .actions
+            .iter()
+            .any(|a| matches!(a, RestoreAction::RepositionFloating { .. })));
+    }
+
+    #[test]
+    fn diff_fullscreen_changed_emits_set_fullscreen() {
+        let mut target_w = win("0xa", 1, false);
+        target_w.fullscreen = 2;
+        let live_w = win("0xa", 1, false); // fullscreen = 0 (default)
+        let target = snap(vec![target_w]);
+        let live = snap(vec![live_w]);
+        let d = target.diff_against(&live);
+        assert!(d.actions.iter().any(|a| matches!(
+            a,
+            RestoreAction::SetFullscreen { from_mode: 0, to_mode: 2, .. }
+        )));
+    }
+
+    #[test]
+    fn diff_pin_changed_emits_set_pin_only_when_floating() {
+        // Floating: pin diff produces an action.
+        let mut t = win("0xa", 1, true);
+        t.pinned = true;
+        let target = snap(vec![t]);
+        let live = snap(vec![win("0xa", 1, true)]);
+        let d = target.diff_against(&live);
+        assert!(d.actions.iter().any(|a| matches!(
+            a,
+            RestoreAction::SetPin { target: true, .. }
+        )));
+
+        // Tiled: pin diff is suppressed (Hyprland refuses to pin tiled).
+        let mut t = win("0xb", 1, false);
+        t.pinned = true;
+        let target = snap(vec![t]);
+        let live = snap(vec![win("0xb", 1, false)]);
+        let d = target.diff_against(&live);
+        assert!(!d
+            .actions
+            .iter()
+            .any(|a| matches!(a, RestoreAction::SetPin { .. })));
+    }
+
+    #[test]
+    fn diff_active_focus_emits_when_target_window_present() {
+        let mut target = snap(vec![win("0xa", 1, false), win("0xb", 2, false)]);
+        target.active_window_address = Some("0xa".into());
+        let mut live = snap(vec![win("0xa", 1, false), win("0xb", 2, false)]);
+        live.active_window_address = Some("0xb".into());
+        let d = target.diff_against(&live);
+        assert!(matches!(
+            d.actions.last().unwrap(),
+            RestoreAction::RestoreActiveFocus { address, .. } if address == "0xa"
+        ));
+    }
+
+    #[test]
+    fn diff_active_focus_suppressed_when_target_window_missing() {
+        let mut target = snap(vec![win("0xa", 1, false)]);
+        target.active_window_address = Some("0xdead".into()); // not present in live
+        let live = snap(vec![win("0xa", 1, false)]);
+        let d = target.diff_against(&live);
+        assert!(!d
+            .actions
+            .iter()
+            .any(|a| matches!(a, RestoreAction::RestoreActiveFocus { .. })));
+    }
+
+    #[test]
+    fn diff_actions_emitted_in_restore_order() {
+        // For a single window: workspace → floating → reposition → fullscreen → pin.
+        let mut target_w = win("0xa", 2, true);
+        target_w.at = [50, 50];
+        target_w.size = [400, 300];
+        target_w.fullscreen = 1;
+        target_w.pinned = true;
+        let live_w = win("0xa", 1, false); // everything different
+        let target = snap(vec![target_w]);
+        let live = snap(vec![live_w]);
+        let d = target.diff_against(&live);
+        let kinds: Vec<&str> = d
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                RestoreAction::MoveToWorkspace { .. } => Some("workspace"),
+                RestoreAction::ToggleFloating { .. } => Some("floating"),
+                RestoreAction::RepositionFloating { .. } => Some("reposition"),
+                RestoreAction::SetFullscreen { .. } => Some("fullscreen"),
+                RestoreAction::SetPin { .. } => Some("pin"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["workspace", "floating", "reposition", "fullscreen", "pin"]
+        );
+    }
+
+    #[test]
     fn save_load_roundtrip() {
         let dir = std::env::temp_dir().join(format!("hyprpilot-snap-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

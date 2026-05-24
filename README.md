@@ -108,11 +108,23 @@ files under `$XDG_STATE_HOME/hyprpilot/snapshots/<name>.json`.
 ```
 
 Restore is best-effort. It matches live windows to snapshot entries by
-address, then PID, then `(initial_class, initial_title)`. For each match,
-it restores **workspace** and **floating** state. Exact geometry,
-fullscreen mode, pin state, focus order, and re-spawn of missing windows
-are documented as v0.4 work. Windows present live but absent from the
-snapshot are left alone; restore is never destructive.
+address, then PID, then `(initial_class, initial_title)`. For each
+match, the diff is computed across these dimensions:
+
+- **workspace** — always.
+- **floating** state — always.
+- **floating-window geometry** — exact (x, y) and (w, h), via
+  `movewindowpixel` and `resizewindowpixel`. Tiled windows are
+  layout-driven, so geometry diffs are suppressed for them.
+- **fullscreen mode** — via `fullscreenstate`, no focus disturbance.
+- **pinned state** — for floating windows only (Hyprland refuses to
+  pin tiled windows).
+- **active focus** — the snapshot's focused window is refocused last
+  so it overrides any focus side-effects from earlier actions.
+
+Re-spawn of missing windows (snapshot entries whose process is gone) is
+future work. Windows present live but absent from the snapshot are left
+alone; restore is never destructive.
 
 ### Persistent undo
 
@@ -136,8 +148,12 @@ empty rather than aborting.
 
 - v0.1 (done): core + daemon + CLI, ~15 dispatchers, in-memory undo.
 - v0.2 (done): MCP server, capability profiles, dry-run.
-- v0.3 (in progress): snapshots (capture / list / diff / restore / delete),
+- v0.3 (done): snapshots (capture / list / diff / restore / delete),
   persistent undo across daemon restarts.
-- v0.4: event-driven rules engine, exact geometry / fullscreen in restore.
+- v0.4 (in progress):
+  - **restore completeness**: geometry, fullscreen, pin, active focus —
+    in restore.
+  - **rules engine**: daemon-side reactions to socket2 events with TOML
+    rule files (separate PR).
 - v0.5: input synthesis (wtype / ydotool / libei).
 - v0.6: screen capture + OCR.
