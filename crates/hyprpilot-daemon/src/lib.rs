@@ -8,6 +8,7 @@
 //! used by clients: [`protocol::Request`], [`protocol::Response`],
 //! [`client::DaemonClient`], and [`socket::default_socket_path`].
 
+pub mod actions;
 pub mod client;
 pub mod protocol;
 pub mod rules;
