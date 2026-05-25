@@ -16,7 +16,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, warn};
 
-use hyprpilot_core::snapshot::{RestoreAction, SnapshotDiff};
+use hyprpilot_core::snapshot::SnapshotRestorePreview;
 use hyprpilot_daemon::client::{ClientError, DaemonClient};
 use hyprpilot_daemon::protocol::Request;
 use hyprpilot_vision::{GrimCapture, TesseractOcr};
@@ -215,12 +215,15 @@ impl Server {
         }
     }
 
-    /// Dry-run preview for `snapshot_restore`: fetch the diff from the daemon
-    /// and render the action list inline. On any daemon error (notably
-    /// `snapshot_not_found`), propagate via the normal error path so the
-    /// agent sees the same JSON-RPC codes it would for a non-dry-run call.
+    /// Dry-run preview for `snapshot_restore`: fetch the rich preview from
+    /// the daemon and emit it as a single JSON content block. The agent
+    /// gets the human-readable summary, the per-category counts, and the
+    /// full action list in one tool call — no separate `snapshot_diff`
+    /// round-trip needed. On any daemon error (notably `snapshot_not_found`),
+    /// propagate via the normal error path so the agent sees the same
+    /// JSON-RPC codes it would for a non-dry-run call.
     async fn preview_snapshot_restore(&mut self, id: Value, name: String) -> JsonRpcResponse {
-        let value = match self.call_daemon(Request::SnapshotDiff { name: name.clone() }).await {
+        let value = match self.call_daemon(Request::SnapshotPreview { name }).await {
             Ok(v) => v,
             Err(e) => {
                 self.daemon = None;
@@ -228,17 +231,17 @@ impl Server {
                 return tool_error(id, code, message);
             }
         };
-        let diff: SnapshotDiff = match serde_json::from_value(value) {
-            Ok(d) => d,
+        let preview: SnapshotRestorePreview = match serde_json::from_value(value) {
+            Ok(p) => p,
             Err(e) => {
                 return tool_error(
                     id,
                     ErrorCode::ToolExecution,
-                    format!("daemon returned malformed snapshot diff: {e}"),
+                    format!("daemon returned malformed snapshot preview: {e}"),
                 );
             }
         };
-        let body = render_restore_preview(&name, &diff);
+        let body = render_dry_run_body(&preview);
         JsonRpcResponse::ok(
             id,
             CallToolResult { content: vec![Content::text(body)], is_error: false },
@@ -344,124 +347,19 @@ fn tool_error(id: Value, code: ErrorCode, message: String) -> JsonRpcResponse {
 ///
 /// The daemon's structured code is preserved as a `[code]` prefix in the
 /// message so the agent and humans can still see exactly what failed.
-/// Format a `SnapshotDiff` into a human-readable preview body for
-/// `snapshot_restore --dry-run`. Caps the action list at 10 lines; an
-/// agent that wants the full list can still call `snapshot_diff` directly.
-fn plural(n: usize) -> &'static str {
-    if n == 1 { "" } else { "s" }
-}
-
-fn render_restore_preview(name: &str, diff: &SnapshotDiff) -> String {
-    let mut moves = 0usize;
-    let mut floats = 0usize;
-    let mut repositions = 0usize;
-    let mut fullscreens = 0usize;
-    let mut pins = 0usize;
-    let mut refocus = 0usize;
-    let mut missing = 0usize;
-    let mut extra = 0usize;
-    for a in &diff.actions {
-        match a {
-            RestoreAction::MoveToWorkspace { .. } => moves += 1,
-            RestoreAction::ToggleFloating { .. } => floats += 1,
-            RestoreAction::RepositionFloating { .. } => repositions += 1,
-            RestoreAction::SetFullscreen { .. } => fullscreens += 1,
-            RestoreAction::SetPin { .. } => pins += 1,
-            RestoreAction::RestoreActiveFocus { .. } => refocus += 1,
-            RestoreAction::WindowMissing { .. } => missing += 1,
-            RestoreAction::WindowNotInSnapshot { .. } => extra += 1,
-        }
-    }
-
-    let mut out = String::new();
-    out.push_str(&format!("[dry_run] would restore snapshot `{name}`:\n"));
-    out.push_str(&format!(
-        "  {moves} workspace move{}, {floats} float toggle{}, \
-         {repositions} reposition{}, {fullscreens} fullscreen change{}, \
-         {pins} pin toggle{}, {refocus} refocus, \
-         {missing} missing, {extra} not in snapshot\n",
-        plural(moves),
-        plural(floats),
-        plural(repositions),
-        plural(fullscreens),
-        plural(pins),
-    ));
-
-    if diff.mutation_count() == 0 {
-        out.push_str("  (no changes — current state already matches the snapshot)\n");
-    } else {
-        let mut shown = 0usize;
-        const LIMIT: usize = 10;
-        let mutating: Vec<&RestoreAction> = diff
-            .actions
-            .iter()
-            .filter(|a| {
-                matches!(
-                    a,
-                    RestoreAction::MoveToWorkspace { .. }
-                        | RestoreAction::ToggleFloating { .. }
-                        | RestoreAction::RepositionFloating { .. }
-                        | RestoreAction::SetFullscreen { .. }
-                        | RestoreAction::SetPin { .. }
-                        | RestoreAction::RestoreActiveFocus { .. }
-                )
-            })
-            .collect();
-        for a in mutating.iter().take(LIMIT) {
-            match a {
-                RestoreAction::MoveToWorkspace { address, to_workspace, .. } => {
-                    out.push_str(&format!(
-                        "  move address:{address} to workspace {to_workspace}\n"
-                    ));
-                }
-                RestoreAction::ToggleFloating { address, target } => {
-                    out.push_str(&format!(
-                        "  toggle floating address:{address} → {target}\n"
-                    ));
-                }
-                RestoreAction::RepositionFloating {
-                    address,
-                    target_at,
-                    target_size,
-                    ..
-                } => {
-                    out.push_str(&format!(
-                        "  reposition address:{address} → at=({},{}) size=({},{})\n",
-                        target_at[0], target_at[1], target_size[0], target_size[1]
-                    ));
-                }
-                RestoreAction::SetFullscreen { address, to_mode, .. } => {
-                    let label = match to_mode {
-                        0 => "none".to_string(),
-                        1 => "maximize".to_string(),
-                        2 => "fullscreen".to_string(),
-                        n => format!("mode {n}"),
-                    };
-                    out.push_str(&format!(
-                        "  fullscreen address:{address} → {label}\n"
-                    ));
-                }
-                RestoreAction::SetPin { address, target } => {
-                    out.push_str(&format!(
-                        "  pin address:{address} → {target}\n"
-                    ));
-                }
-                RestoreAction::RestoreActiveFocus { address, .. } => {
-                    out.push_str(&format!(
-                        "  refocus address:{address}\n"
-                    ));
-                }
-                _ => {}
-            }
-            shown += 1;
-        }
-        let total = mutating.len();
-        if total > shown {
-            out.push_str(&format!("  ... and {} more\n", total - shown));
-        }
-    }
-    out.push_str("\nPass `dry_run: false` to apply.");
-    out
+/// Format a [`SnapshotRestorePreview`] for the MCP dry-run response.
+///
+/// The body is the human summary on the first line, followed by the full
+/// preview as pretty-printed JSON so an agent can drill into `will_apply`
+/// / `will_skip` / per-action details without a second tool call. Closes
+/// with a one-line reminder to pass `dry_run: false` to apply.
+fn render_dry_run_body(preview: &SnapshotRestorePreview) -> String {
+    let json = serde_json::to_string_pretty(preview)
+        .unwrap_or_else(|_| "{}".to_string());
+    format!(
+        "[dry_run] {summary}\n\n{json}\n\nPass `dry_run: false` to apply.",
+        summary = preview.human_summary,
+    )
 }
 
 /// Run a capture op and wrap the bytes in an MCP `image` content block.

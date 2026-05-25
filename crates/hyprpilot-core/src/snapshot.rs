@@ -24,10 +24,12 @@
 //! left alone — restore is additive, never destructive.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -39,7 +41,7 @@ use crate::selector::{WindowSelector, WorkspaceRef};
 // =============================================================================
 
 /// One serialized snapshot. Persisted as JSON.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Snapshot {
     pub name: String,
     pub created_at_unix: i64,
@@ -51,7 +53,7 @@ pub struct Snapshot {
     pub active_workspace_id: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WindowSnapshot {
     /// Hex pointer (`0x...`) at capture time. May not survive Hyprland
     /// restart; the identity tuple below is the fallback.
@@ -76,7 +78,7 @@ pub struct WindowSnapshot {
     pub pinned: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkspaceSnapshot {
     pub id: i32,
     pub name: String,
@@ -84,7 +86,7 @@ pub struct WorkspaceSnapshot {
     pub windows: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MonitorSnapshot {
     pub name: String,
     pub active_workspace_id: i32,
@@ -95,7 +97,7 @@ pub struct MonitorSnapshot {
 // =============================================================================
 
 /// One restore action computed from a diff. `apply_diff` consumes these.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RestoreAction {
     /// Window in the snapshot is not present in live state. Reported only;
@@ -164,7 +166,7 @@ pub enum RestoreAction {
     },
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SnapshotDiff {
     pub actions: Vec<RestoreAction>,
 }
@@ -173,24 +175,191 @@ impl SnapshotDiff {
     /// Number of actions that would actually mutate Hyprland (informational
     /// actions like `WindowMissing` don't count).
     pub fn mutation_count(&self) -> usize {
-        self.actions
-            .iter()
-            .filter(|a| {
-                matches!(
-                    a,
-                    RestoreAction::MoveToWorkspace { .. }
-                        | RestoreAction::ToggleFloating { .. }
-                        | RestoreAction::RepositionFloating { .. }
-                        | RestoreAction::SetFullscreen { .. }
-                        | RestoreAction::SetPin { .. }
-                        | RestoreAction::RestoreActiveFocus { .. }
-                )
-            })
-            .count()
+        self.actions.iter().filter(|a| is_mutating(a)).count()
     }
 
     pub fn is_no_op(&self) -> bool {
         self.mutation_count() == 0
+    }
+}
+
+/// True for actions that actually change Hyprland state; false for the
+/// informational `WindowMissing` / `WindowNotInSnapshot` variants.
+fn is_mutating(a: &RestoreAction) -> bool {
+    matches!(
+        a,
+        RestoreAction::MoveToWorkspace { .. }
+            | RestoreAction::ToggleFloating { .. }
+            | RestoreAction::RepositionFloating { .. }
+            | RestoreAction::SetFullscreen { .. }
+            | RestoreAction::SetPin { .. }
+            | RestoreAction::RestoreActiveFocus { .. }
+    )
+}
+
+// =============================================================================
+// Restore preview — what the dry-run surface returns to MCP clients
+// =============================================================================
+
+/// Rich preview of what a `snapshot_restore` would do. Wraps the existing
+/// [`SnapshotDiff`] with counts, the actions split into "will apply" vs
+/// "will skip", and a one-paragraph human-readable summary suitable for
+/// dropping into an LLM-facing tool response.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SnapshotRestorePreview {
+    /// Name of the snapshot being previewed.
+    pub snapshot_name: String,
+    /// `created_at_unix` from the snapshot itself — agents may want it to
+    /// reason about staleness without a second `snapshot_list` round-trip.
+    pub snapshot_created_at_unix: i64,
+    /// The structured diff. Identical to what `snapshot_diff` returns.
+    pub diff: SnapshotDiff,
+    /// Per-category counts.
+    pub summary: PreviewSummary,
+    /// Subset of `diff.actions` that `apply_diff` will attempt to apply
+    /// (everything `mutation_count` counts).
+    pub will_apply: Vec<RestoreAction>,
+    /// Subset of `diff.actions` that are informational only —
+    /// `WindowMissing` (snapshot window not currently running) and
+    /// `WindowNotInSnapshot` (live window absent from snapshot, left alone
+    /// by restore).
+    pub will_skip: Vec<RestoreAction>,
+    /// One paragraph of plain English describing the restore. Zero-count
+    /// categories are omitted; phrasing is plural-aware.
+    pub human_summary: String,
+}
+
+/// Per-action-kind counts for a restore preview. All fields are `usize`;
+/// zero means that category contributes nothing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct PreviewSummary {
+    /// Total number of actions in the diff (including informational).
+    pub total_actions: usize,
+    /// Number of actions that would actually change Hyprland state.
+    pub mutating_actions: usize,
+    pub move_to_workspace: usize,
+    pub toggle_floating: usize,
+    pub reposition_floating: usize,
+    pub set_fullscreen: usize,
+    pub set_pin: usize,
+    pub restore_active_focus: usize,
+    /// Windows in the snapshot but not in live state (cannot be restored).
+    pub windows_missing: usize,
+    /// Windows in live state but not in the snapshot (left alone — restore
+    /// is non-destructive).
+    pub windows_extra: usize,
+}
+
+impl SnapshotRestorePreview {
+    /// Build a preview from an already-loaded snapshot and a diff computed
+    /// against live state. Pure function — no I/O.
+    pub fn from_snapshot_and_diff(snap: &Snapshot, diff: SnapshotDiff) -> Self {
+        let mut summary = PreviewSummary::default();
+        let mut will_apply = Vec::new();
+        let mut will_skip = Vec::new();
+        for a in &diff.actions {
+            summary.total_actions += 1;
+            match a {
+                RestoreAction::MoveToWorkspace { .. } => summary.move_to_workspace += 1,
+                RestoreAction::ToggleFloating { .. } => summary.toggle_floating += 1,
+                RestoreAction::RepositionFloating { .. } => summary.reposition_floating += 1,
+                RestoreAction::SetFullscreen { .. } => summary.set_fullscreen += 1,
+                RestoreAction::SetPin { .. } => summary.set_pin += 1,
+                RestoreAction::RestoreActiveFocus { .. } => summary.restore_active_focus += 1,
+                RestoreAction::WindowMissing { .. } => summary.windows_missing += 1,
+                RestoreAction::WindowNotInSnapshot { .. } => summary.windows_extra += 1,
+            }
+            if is_mutating(a) {
+                summary.mutating_actions += 1;
+                will_apply.push(a.clone());
+            } else {
+                will_skip.push(a.clone());
+            }
+        }
+
+        let human_summary = render_human_summary(&summary);
+
+        Self {
+            snapshot_name: snap.name.clone(),
+            snapshot_created_at_unix: snap.created_at_unix,
+            diff,
+            summary,
+            will_apply,
+            will_skip,
+            human_summary,
+        }
+    }
+}
+
+/// One-paragraph plain English summary. Categories with zero count are
+/// omitted. `windows_missing` is called out as a note because LLMs need to
+/// know that part of the snapshot's state can't be restored.
+fn render_human_summary(s: &PreviewSummary) -> String {
+    fn win(n: usize) -> String {
+        format!("{n} window{}", if n == 1 { "" } else { "s" })
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if s.move_to_workspace > 0 {
+        parts.push(format!("move {}", win(s.move_to_workspace)));
+    }
+    if s.toggle_floating > 0 {
+        parts.push(format!("toggle floating on {}", win(s.toggle_floating)));
+    }
+    if s.reposition_floating > 0 {
+        parts.push(format!("reposition {}", win(s.reposition_floating)));
+    }
+    if s.set_fullscreen > 0 {
+        parts.push(format!(
+            "change fullscreen on {}",
+            win(s.set_fullscreen)
+        ));
+    }
+    if s.set_pin > 0 {
+        parts.push(format!("toggle pin on {}", win(s.set_pin)));
+    }
+    if s.restore_active_focus > 0 {
+        parts.push("refocus the snapshot's active window".to_string());
+    }
+
+    let mut out = String::new();
+    if parts.is_empty() {
+        out.push_str("No changes — current state already matches the snapshot.");
+    } else {
+        out.push_str("Would ");
+        out.push_str(&join_with_and(&parts));
+        out.push('.');
+    }
+
+    if s.windows_missing > 0 {
+        let _ = write!(
+            out,
+            " {} in the snapshot {} not currently running and will be skipped.",
+            win(s.windows_missing),
+            if s.windows_missing == 1 { "is" } else { "are" },
+        );
+    }
+    if s.windows_extra > 0 {
+        let _ = write!(
+            out,
+            " {} open now {} not in the snapshot and will be left alone.",
+            win(s.windows_extra),
+            if s.windows_extra == 1 { "is" } else { "are" },
+        );
+    }
+    out
+}
+
+/// English list-join: "a", "a and b", "a, b, and c".
+fn join_with_and(parts: &[String]) -> String {
+    match parts.len() {
+        0 => String::new(),
+        1 => parts[0].clone(),
+        2 => format!("{} and {}", parts[0], parts[1]),
+        _ => {
+            let head = parts[..parts.len() - 1].join(", ");
+            format!("{head}, and {}", parts[parts.len() - 1])
+        }
     }
 }
 
@@ -477,7 +646,7 @@ pub async fn apply_diff(conn: &Connection, diff: &SnapshotDiff) -> Vec<ApplyOutc
     outcomes
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ApplyOutcome {
     pub action: RestoreAction,
     pub ok: bool,
@@ -867,6 +1036,139 @@ mod tests {
             kinds,
             vec!["workspace", "floating", "reposition", "fullscreen", "pin"]
         );
+    }
+
+    // ---- preview tests --------------------------------------------------
+
+    #[test]
+    fn preview_no_changes() {
+        let s = snap(vec![win("0xa", 1, false)]);
+        let d = s.diff_against(&s);
+        let p = SnapshotRestorePreview::from_snapshot_and_diff(&s, d);
+
+        assert_eq!(p.snapshot_name, "t");
+        assert_eq!(p.summary.total_actions, 0);
+        assert_eq!(p.summary.mutating_actions, 0);
+        assert!(p.will_apply.is_empty());
+        assert!(p.will_skip.is_empty());
+        assert_eq!(
+            p.human_summary,
+            "No changes — current state already matches the snapshot."
+        );
+    }
+
+    #[test]
+    fn preview_splits_apply_vs_skip() {
+        // Target: 0xa on ws 1, plus 0xb on ws 2 (only in snapshot).
+        // Live: 0xa on ws 2 (will move), plus 0xc (extra in live).
+        let target = snap(vec![win("0xa", 1, false), win("0xb", 2, false)]);
+        let mut live_extra = win("0xc", 1, false);
+        live_extra.pid = 999;
+        live_extra.initial_class = "Other".into();
+        let mut live_a = win("0xa", 2, false);
+        live_a.pid = 100;
+        let live = snap(vec![live_a, live_extra]);
+
+        let d = target.diff_against(&live);
+        let p = SnapshotRestorePreview::from_snapshot_and_diff(&target, d);
+
+        assert_eq!(p.summary.move_to_workspace, 1);
+        assert_eq!(p.summary.windows_missing, 1);
+        assert_eq!(p.summary.windows_extra, 1);
+        assert_eq!(p.summary.mutating_actions, 1);
+        assert_eq!(p.summary.total_actions, 3);
+        assert_eq!(p.will_apply.len(), 1);
+        assert!(matches!(
+            p.will_apply[0],
+            RestoreAction::MoveToWorkspace { .. }
+        ));
+        assert_eq!(p.will_skip.len(), 2);
+    }
+
+    #[test]
+    fn preview_human_summary_everything_different() {
+        // One window where every category mutates: workspace, floating,
+        // reposition, fullscreen, pin — plus a refocus.
+        let mut target_w = win("0xa", 2, true);
+        target_w.at = [50, 50];
+        target_w.size = [400, 300];
+        target_w.fullscreen = 1;
+        target_w.pinned = true;
+        let mut target = snap(vec![target_w, win("0xb", 1, false)]);
+        target.active_window_address = Some("0xb".into());
+
+        let live_w = win("0xa", 1, false);
+        let mut live = snap(vec![live_w, win("0xb", 1, false)]);
+        live.active_window_address = Some("0xa".into());
+
+        let d = target.diff_against(&live);
+        let p = SnapshotRestorePreview::from_snapshot_and_diff(&target, d);
+
+        assert_eq!(
+            p.human_summary,
+            "Would move 1 window, toggle floating on 1 window, reposition 1 window, \
+             change fullscreen on 1 window, toggle pin on 1 window, and refocus \
+             the snapshot's active window."
+        );
+    }
+
+    #[test]
+    fn preview_human_summary_only_missing_window() {
+        let target = snap(vec![win("0xa", 1, false), win("0xb", 2, false)]);
+        let live = snap(vec![win("0xa", 1, false)]);
+        let d = target.diff_against(&live);
+        let p = SnapshotRestorePreview::from_snapshot_and_diff(&target, d);
+
+        assert_eq!(p.summary.mutating_actions, 0);
+        assert_eq!(p.summary.windows_missing, 1);
+        assert_eq!(
+            p.human_summary,
+            "No changes — current state already matches the snapshot. \
+             1 window in the snapshot is not currently running and will be skipped."
+        );
+    }
+
+    #[test]
+    fn preview_human_summary_plural_aware() {
+        // Three windows all on the wrong workspace.
+        let target = snap(vec![
+            win("0xa", 1, false),
+            win("0xb", 1, false),
+            win("0xc", 1, false),
+        ]);
+        let live = snap(vec![
+            win("0xa", 2, false),
+            win("0xb", 2, false),
+            win("0xc", 2, false),
+        ]);
+        let d = target.diff_against(&live);
+        let p = SnapshotRestorePreview::from_snapshot_and_diff(&target, d);
+
+        assert_eq!(p.human_summary, "Would move 3 windows.");
+    }
+
+    #[test]
+    fn preview_human_summary_two_categories_uses_and() {
+        let target = snap(vec![win("0xa", 2, true)]);
+        let live = snap(vec![win("0xa", 1, false)]);
+        let d = target.diff_against(&live);
+        let p = SnapshotRestorePreview::from_snapshot_and_diff(&target, d);
+        // Two categories: move + toggle floating. Joined with " and ".
+        assert_eq!(
+            p.human_summary,
+            "Would move 1 window and toggle floating on 1 window."
+        );
+    }
+
+    #[test]
+    fn preview_includes_snapshot_metadata() {
+        let mut s = snap(vec![win("0xa", 1, false)]);
+        s.created_at_unix = 1234567890;
+        s.name = "my_layout".into();
+        let d = s.diff_against(&s);
+        let p = SnapshotRestorePreview::from_snapshot_and_diff(&s, d);
+        assert_eq!(p.snapshot_name, "my_layout");
+        assert_eq!(p.snapshot_created_at_unix, 1234567890);
     }
 
     #[test]

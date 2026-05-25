@@ -68,6 +68,11 @@ pub enum Request {
     SnapshotList,
     /// Show what a restore would change without applying.
     SnapshotDiff { name: String },
+    /// Rich preview of what a restore would do: the diff plus
+    /// per-category counts, a will_apply / will_skip split, and a
+    /// plain-English summary. Composes `load` + `capture` + `diff_against`
+    /// + `SnapshotRestorePreview::from_snapshot_and_diff`.
+    SnapshotPreview { name: String },
     /// Restore a snapshot. Captures an implicit `_pre-restore-<unix_ts>`
     /// snapshot first so the operation is itself reversible.
     SnapshotRestore { name: String },

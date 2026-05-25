@@ -693,10 +693,16 @@ pub fn registry() -> Vec<ToolDef> {
             true,
             "Restore a named snapshot. Best-effort: matches live windows to \
              snapshot entries by address, then pid, then (initial_class, \
-             initial_title). For each match, restores workspace and floating \
-             state. Exact geometry, fullscreen mode, focus order, and \
-             re-spawn of missing windows are NOT restored in v0.3. Before \
-             restoring, the current state is auto-saved as \
+             initial_title). For each match, restores workspace, floating \
+             state, floating geometry, fullscreen mode, and pin. \
+             Re-spawn of missing windows is NOT supported — those are \
+             reported and skipped. \
+             With `dry_run: true` (default) the response is a rich \
+             preview: a plain-English summary, per-category counts, the \
+             list of actions that would be applied, and the list that \
+             would be skipped. With `dry_run: false` the preview is \
+             still included alongside the per-action apply outcomes. \
+             Before applying, the current state is auto-saved as \
              `_pre-restore-<unix_ts>` so this op is itself reversible.",
         ),
         def::<SnapshotNameArgs>(
@@ -972,9 +978,11 @@ pub fn dispatch(name: &str, args: Value) -> Result<Dispatch, DispatchError> {
         "snapshot_restore" => {
             let p: SnapshotMutArgs = parse_args(name, args)?;
             Ok(if p.dry_run {
-                // Defer formatting to the server, which needs to call the
-                // daemon to fetch the diff. Generic Preview text is too vague
-                // for a restore — the operation can be dozens of mutations.
+                // Defer to the server, which calls the daemon's
+                // SnapshotPreview RPC to fetch a rich preview (summary +
+                // will_apply / will_skip). Generic Preview text is too
+                // vague for a restore — the operation can be dozens of
+                // mutations and the LLM needs the structured shape.
                 Dispatch::PreviewSnapshotRestore { name: p.name }
             } else {
                 Dispatch::Forward(Request::SnapshotRestore { name: p.name })

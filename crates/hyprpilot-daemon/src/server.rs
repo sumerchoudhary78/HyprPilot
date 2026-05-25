@@ -304,6 +304,7 @@ async fn handle_request(state: &State, req: Request) -> Response {
         Request::SnapshotSave { name } => snapshot_save(state, name).await,
         Request::SnapshotList => snapshot_list(),
         Request::SnapshotDiff { name } => snapshot_diff(state, name).await,
+        Request::SnapshotPreview { name } => snapshot_preview(state, name).await,
         Request::SnapshotRestore { name } => snapshot_restore(state, name).await,
         Request::SnapshotDelete { name } => snapshot_delete(name),
 
@@ -595,8 +596,23 @@ async fn snapshot_diff(state: &State, name: String) -> Response {
     Response::ok(diff)
 }
 
+async fn snapshot_preview(state: &State, name: String) -> Response {
+    use hyprpilot_core::snapshot::{load_named, Snapshot, SnapshotRestorePreview};
+    let target = match load_named(&name) {
+        Ok(s) => s,
+        Err(e) => return snapshot_load_error(e),
+    };
+    let live = match Snapshot::capture(&state.hypr, "_live_").await {
+        Ok(s) => s,
+        Err(e) => return core_error(e),
+    };
+    let diff = target.diff_against(&live);
+    let preview = SnapshotRestorePreview::from_snapshot_and_diff(&target, diff);
+    Response::ok(preview)
+}
+
 async fn snapshot_restore(state: &State, name: String) -> Response {
-    use hyprpilot_core::snapshot::{apply_diff, load_named, Snapshot};
+    use hyprpilot_core::snapshot::{apply_diff, load_named, Snapshot, SnapshotRestorePreview};
     let target = match load_named(&name) {
         Ok(s) => s,
         Err(e) => return snapshot_load_error(e),
@@ -618,12 +634,16 @@ async fn snapshot_restore(state: &State, name: String) -> Response {
         Err(e) => return core_error(e),
     };
     let diff = target.diff_against(&live);
+    // Build the preview from the pre-apply diff so the response carries both
+    // the plan and the per-action outcomes. Cloning the diff is cheap.
+    let preview = SnapshotRestorePreview::from_snapshot_and_diff(&target, diff.clone());
     let outcomes = apply_diff(&state.hypr, &diff).await;
     Response::ok(serde_json::json!({
         "restored": name,
         "pre_restore_snapshot": pre_name,
         "mutations_attempted": diff.mutation_count(),
         "outcomes": outcomes,
+        "preview": preview,
     }))
 }
 
