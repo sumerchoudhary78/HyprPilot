@@ -23,6 +23,41 @@ pub struct Region {
     pub h: u32,
 }
 
+/// A bounding box returned by OCR. Distinct from [`Region`] in two ways:
+/// width/height are signed so degenerate-but-non-zero tesseract output
+/// (negative dims from a malformed TSV row, theoretically) doesn't panic
+/// on unsigned arithmetic; and the coordinate space here is the *image*
+/// the OCR ran on, not the compositor — composite tools that pass a
+/// region to capture must add the region's origin to translate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BBox {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+impl BBox {
+    /// Centre point in the image coordinate space. Saturating arithmetic so
+    /// a malformed box can't overflow.
+    pub fn center(&self) -> (i32, i32) {
+        (
+            self.x.saturating_add(self.w / 2),
+            self.y.saturating_add(self.h / 2),
+        )
+    }
+
+    /// Merge two boxes into the smallest box containing both. Used by
+    /// `find_word_runs` to coalesce consecutive words into one match.
+    pub fn union(&self, other: &BBox) -> BBox {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = (self.x.saturating_add(self.w)).max(other.x.saturating_add(other.w));
+        let bottom = (self.y.saturating_add(self.h)).max(other.y.saturating_add(other.h));
+        BBox { x, y, w: right - x, h: bottom - y }
+    }
+}
+
 impl Region {
     /// Encode in `grim -g` geometry form: `"X,Y WxH"`.
     pub fn grim_geometry(&self) -> String {
