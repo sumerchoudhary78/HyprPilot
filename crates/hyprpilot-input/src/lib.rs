@@ -41,6 +41,8 @@
 pub mod detect;
 pub mod error;
 pub mod keys;
+#[cfg(feature = "libei")]
+pub mod libei;
 pub mod runner;
 
 pub use detect::BackendAvailability;

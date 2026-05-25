@@ -97,6 +97,7 @@ pub async fn run(socket_path: PathBuf) -> AnyResult<()> {
     let input_runner = Arc::new(InputRunner::detect());
     if input_enabled {
         info!(
+            backend = input_runner.backend_name(),
             wtype = ?input_runner.backends().wtype,
             ydotool = ?input_runner.backends().ydotool,
             "input synthesis ENABLED (HYPRPILOT_DANGEROUS_INPUT_OK=1)"
@@ -342,6 +343,8 @@ fn input_error_response(e: InputError) -> Response {
         InputError::DaemonNotReachable(_) => codes::INPUT_DAEMON_MISSING,
         InputError::InvalidCombo(_) | InputError::InvalidButton(_) => codes::INPUT_INVALID,
         InputError::BackendFailed { .. } => codes::INPUT_FAILED,
+        InputError::NotImplemented { .. } => codes::INPUT_BACKEND_MISSING,
+        InputError::InvalidBackendSelection(_) => codes::INPUT_BACKEND_MISSING,
         InputError::Io(_) => codes::INPUT_FAILED,
     };
     Response::err(code, e.to_string())

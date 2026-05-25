@@ -1,14 +1,13 @@
-//! [`InputRunner`] — shell-out implementations over wtype + ydotool.
+//! [`InputRunner`] — public facade over a swappable input backend.
 //!
-//! Each method:
-//! 1. Checks the backend is available; returns
-//!    [`InputError::BackendMissing`] if not.
-//! 2. Builds the argv (see `wtype_argv_for_text` etc. for the
-//!    unit-testable parts).
-//! 3. Spawns `tokio::process::Command`, captures stderr for diagnostics,
-//!    returns [`InputError::BackendFailed`] on non-zero exit.
+//! Today the only production backend is the wtype + ydotool shell-out
+//! path. v0.7 adds a [`crate::libei::LibeiBackend`] stub behind the
+//! `libei` cargo feature, selectable via `HYPRPILOT_INPUT_BACKEND=libei`.
+//! Dispatch is an internal enum — callers see only the concrete
+//! `InputRunner` methods, whose signatures are stable across backend
+//! swaps.
 //!
-//! No shell is involved at any point — argv is built as a `Vec<String>`
+//! No shell is involved at any point: argv is built as a `Vec<String>`
 //! and passed via `Command::arg`/`args`. User-supplied text reaches
 //! wtype on stdin (wtype's `-` flag), so even text starting with `-`
 //! cannot be misinterpreted as a flag.
@@ -23,53 +22,175 @@ use crate::detect::BackendAvailability;
 use crate::error::{InputError, Result};
 use crate::keys::{KeyCombo, MouseButton};
 
+/// Env var selecting the input backend at daemon startup.
+///
+/// - unset / `wtype` — default wtype + ydotool path.
+/// - `libei` — only honoured when compiled with `--features libei`;
+///   otherwise [`InputError::InvalidBackendSelection`].
+pub const BACKEND_ENV: &str = "HYPRPILOT_INPUT_BACKEND";
+
+enum BackendImpl {
+    WtypeYdotool(WtypeYdotoolBackend),
+    #[cfg(feature = "libei")]
+    Libei(crate::libei::LibeiBackend),
+}
+
+impl BackendImpl {
+    fn name(&self) -> &'static str {
+        match self {
+            BackendImpl::WtypeYdotool(_) => "wtype",
+            #[cfg(feature = "libei")]
+            BackendImpl::Libei(_) => "libei",
+        }
+    }
+}
+
 pub struct InputRunner {
     pub(crate) backends: BackendAvailability,
+    backend: BackendImpl,
 }
 
 impl InputRunner {
+    /// Construct with explicit detection results. Selects the wtype path
+    /// unconditionally — used by tests and any caller that wants to
+    /// bypass the env-var selector.
     pub fn with_backends(backends: BackendAvailability) -> Self {
-        Self { backends }
+        let backend = BackendImpl::WtypeYdotool(WtypeYdotoolBackend {
+            backends: backends.clone(),
+        });
+        Self { backends, backend }
     }
 
+    /// Probe `$PATH` and pick a backend.
+    ///
+    /// Reads [`BACKEND_ENV`] to decide between `wtype` (default) and
+    /// `libei` (gated on cargo feature + env var). On any selection
+    /// error it logs and falls back to the wtype path — the daemon
+    /// should remain runnable.
     pub fn detect() -> Self {
-        Self::with_backends(BackendAvailability::detect())
+        let backends = BackendAvailability::detect();
+        Self::detect_with(backends).unwrap_or_else(|err| {
+            tracing::warn!(
+                error = %err,
+                "falling back to wtype backend after selection failure"
+            );
+            Self::with_backends(BackendAvailability::detect())
+        })
+    }
+
+    /// Same as [`Self::detect`] but surfaces backend-selection errors so
+    /// callers (and tests) can assert on them.
+    pub fn detect_with(backends: BackendAvailability) -> Result<Self> {
+        let selection = std::env::var(BACKEND_ENV).ok();
+        match selection.as_deref() {
+            None | Some("") | Some("wtype") => Ok(Self::with_backends(backends)),
+            Some("libei") => Self::new_libei(backends),
+            Some(other) => Err(InputError::InvalidBackendSelection(other.to_string())),
+        }
+    }
+
+    #[cfg(feature = "libei")]
+    fn new_libei(backends: BackendAvailability) -> Result<Self> {
+        let libei = crate::libei::LibeiBackend::detect()?;
+        Ok(Self {
+            backends,
+            backend: BackendImpl::Libei(libei),
+        })
+    }
+
+    #[cfg(not(feature = "libei"))]
+    fn new_libei(_backends: BackendAvailability) -> Result<Self> {
+        Err(InputError::InvalidBackendSelection(
+            "libei (rebuild with `--features libei`)".into(),
+        ))
     }
 
     pub fn backends(&self) -> &BackendAvailability {
         &self.backends
     }
 
-    /// Type free-form text into the focused window via `wtype`.
-    ///
-    /// Text is piped through stdin (wtype's `-` flag), so leading `-`
-    /// characters are NOT misinterpreted as options.
+    /// Name of the active backend — `"wtype"` or `"libei"`. Useful for
+    /// startup logging and diagnostics.
+    pub fn backend_name(&self) -> &'static str {
+        self.backend.name()
+    }
+
     pub async fn type_text(&self, text: &str) -> Result<()> {
+        match &self.backend {
+            BackendImpl::WtypeYdotool(b) => b.type_text(text).await,
+            #[cfg(feature = "libei")]
+            BackendImpl::Libei(_) => Err(InputError::NotImplemented {
+                backend: "libei",
+                op: "type_text",
+            }),
+        }
+    }
+
+    pub async fn press_keys(&self, combo: &KeyCombo) -> Result<()> {
+        match &self.backend {
+            BackendImpl::WtypeYdotool(b) => b.press_keys(combo).await,
+            #[cfg(feature = "libei")]
+            BackendImpl::Libei(_) => Err(InputError::NotImplemented {
+                backend: "libei",
+                op: "press_keys",
+            }),
+        }
+    }
+
+    pub async fn mouse_move(&self, x: i32, y: i32, absolute: bool) -> Result<()> {
+        match &self.backend {
+            BackendImpl::WtypeYdotool(b) => b.mouse_move(x, y, absolute).await,
+            #[cfg(feature = "libei")]
+            BackendImpl::Libei(_) => Err(InputError::NotImplemented {
+                backend: "libei",
+                op: "mouse_move",
+            }),
+        }
+    }
+
+    pub async fn mouse_click(&self, button: MouseButton) -> Result<()> {
+        match &self.backend {
+            BackendImpl::WtypeYdotool(b) => b.mouse_click(button).await,
+            #[cfg(feature = "libei")]
+            BackendImpl::Libei(_) => Err(InputError::NotImplemented {
+                backend: "libei",
+                op: "mouse_click",
+            }),
+        }
+    }
+}
+
+// ---- wtype + ydotool backend ---------------------------------------------
+
+struct WtypeYdotoolBackend {
+    backends: BackendAvailability,
+}
+
+impl WtypeYdotoolBackend {
+    async fn type_text(&self, text: &str) -> Result<()> {
         let wtype = self
             .backends
             .wtype
             .as_ref()
             .ok_or(InputError::BackendMissing("wtype"))?;
         if text.is_empty() {
-            return Ok(()); // no-op; wtype would also do nothing
+            return Ok(());
         }
         debug!(bytes = text.len(), "wtype stdin typing");
         let mut child = Command::new(wtype)
-            .arg("-") // read text to type from stdin
+            .arg("-")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()?;
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(text.as_bytes()).await?;
-            // Drop stdin to send EOF; wtype exits once input ends.
         }
         let output = child.wait_with_output().await?;
         finish("wtype", output)
     }
 
-    /// Press a key combo in the focused window via `wtype`.
-    pub async fn press_keys(&self, combo: &KeyCombo) -> Result<()> {
+    async fn press_keys(&self, combo: &KeyCombo) -> Result<()> {
         let wtype = self
             .backends
             .wtype
@@ -87,9 +208,7 @@ impl InputRunner {
         finish("wtype", output)
     }
 
-    /// Move the mouse cursor via `ydotool mousemove`. `absolute=true`
-    /// moves to screen coordinates; `absolute=false` is a relative delta.
-    pub async fn mouse_move(&self, x: i32, y: i32, absolute: bool) -> Result<()> {
+    async fn mouse_move(&self, x: i32, y: i32, absolute: bool) -> Result<()> {
         let ydotool = self
             .backends
             .ydotool
@@ -110,9 +229,7 @@ impl InputRunner {
         finish("ydotool", output)
     }
 
-    /// Click a mouse button (press + release in one shot) via
-    /// `ydotool click`.
-    pub async fn mouse_click(&self, button: MouseButton) -> Result<()> {
+    async fn mouse_click(&self, button: MouseButton) -> Result<()> {
         let ydotool = self
             .backends
             .ydotool
@@ -174,23 +291,20 @@ mod tests {
     use super::*;
     use crate::keys::KeyCombo;
     use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    // Env vars are process-global; serialise the tests that touch
+    // BACKEND_ENV so they don't race each other under `cargo test`.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn no_backends() -> BackendAvailability {
         BackendAvailability {
             wtype: None,
             ydotool: None,
-            // Point at a path we know exists so the socket probe
-            // doesn't pre-empt the BackendMissing(ydotool) check the
-            // test below asserts on.
             ydotoold_socket: PathBuf::from("/bin/true"),
         }
     }
     fn fake_backends() -> BackendAvailability {
-        // Point at /bin/true for wtype / ydotool so the runner can spawn
-        // something and check the success path. Real wtype/ydotool need
-        // a live Wayland compositor and we won't hit them in unit tests.
-        // /bin/true also stands in for ydotoold's socket: the runner
-        // only checks the path exists, not that it's a real socket.
         BackendAvailability {
             wtype: Some(PathBuf::from("/bin/true")),
             ydotool: Some(PathBuf::from("/bin/true")),
@@ -241,18 +355,12 @@ mod tests {
 
     #[tokio::test]
     async fn empty_text_is_a_noop() {
-        // No backend needed for the empty-text fast path? — Actually we
-        // still bail if wtype is missing because we check first.
         let r = InputRunner::with_backends(fake_backends());
-        // With fake `/bin/true` for wtype, type_text("") returns Ok and
-        // doesn't even spawn.
         r.type_text("").await.unwrap();
     }
 
     #[tokio::test]
     async fn fake_wtype_success_path() {
-        // `/bin/true` exits 0 and ignores stdin; finish() sees status
-        // success and returns Ok.
         let r = InputRunner::with_backends(fake_backends());
         r.type_text("hello").await.unwrap();
 
@@ -269,10 +377,6 @@ mod tests {
 
     #[tokio::test]
     async fn mouse_ops_without_ydotoold_socket_return_daemon_not_reachable() {
-        // Regression for issue #14: ydotool installed but ydotoold not
-        // running used to surface as `input_failed` with empty stderr.
-        // Now we probe the socket first and return a typed error with
-        // an actionable hint.
         let r = InputRunner::with_backends(ydotool_present_no_daemon());
         assert!(matches!(
             r.mouse_move(10, 10, false).await,
@@ -302,12 +406,82 @@ mod tests {
 
     #[test]
     fn ydotool_mousemove_argv_double_dash_protects_negative_coords() {
-        // The point of `--`: without it, ydotool would see `-50` as a
-        // short option and reject it. With it, args after are literal.
         let argv = ydotool_mousemove_argv(-100, -200, false);
         assert!(argv.contains(&"--".to_string()));
         let dash_idx = argv.iter().position(|s| s == "--").unwrap();
         let x_idx = argv.iter().position(|s| s == "-100").unwrap();
         assert!(dash_idx < x_idx, "-- must precede negative coords");
+    }
+
+    #[test]
+    fn default_backend_is_wtype() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var(BACKEND_ENV).ok();
+        std::env::remove_var(BACKEND_ENV);
+        let r = InputRunner::detect_with(fake_backends()).unwrap();
+        assert_eq!(r.backend_name(), "wtype");
+        if let Some(v) = prev {
+            std::env::set_var(BACKEND_ENV, v);
+        }
+    }
+
+    #[test]
+    fn unknown_backend_selection_errors() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var(BACKEND_ENV).ok();
+        std::env::set_var(BACKEND_ENV, "garbage");
+        let r = InputRunner::detect_with(fake_backends());
+        match r {
+            Err(InputError::InvalidBackendSelection(s)) => assert_eq!(s, "garbage"),
+            Err(e) => panic!("expected InvalidBackendSelection, got error {e:?}"),
+            Ok(_) => panic!("expected InvalidBackendSelection, got Ok"),
+        }
+        match prev {
+            Some(v) => std::env::set_var(BACKEND_ENV, v),
+            None => std::env::remove_var(BACKEND_ENV),
+        }
+    }
+
+    #[cfg(not(feature = "libei"))]
+    #[test]
+    fn libei_selection_without_feature_errors() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var(BACKEND_ENV).ok();
+        std::env::set_var(BACKEND_ENV, "libei");
+        let r = InputRunner::detect_with(fake_backends());
+        assert!(matches!(r, Err(InputError::InvalidBackendSelection(_))));
+        match prev {
+            Some(v) => std::env::set_var(BACKEND_ENV, v),
+            None => std::env::remove_var(BACKEND_ENV),
+        }
+    }
+
+    #[cfg(feature = "libei")]
+    #[tokio::test]
+    async fn libei_selection_with_feature_returns_not_implemented() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var(BACKEND_ENV).ok();
+        std::env::set_var(BACKEND_ENV, "libei");
+        let r = InputRunner::detect_with(fake_backends())
+            .expect("libei backend should construct under feature flag");
+        assert_eq!(r.backend_name(), "libei");
+        match r.type_text("hi").await {
+            Err(InputError::NotImplemented {
+                backend: "libei",
+                op: "type_text",
+            }) => {}
+            other => panic!("expected NotImplemented(libei, type_text), got {other:?}"),
+        }
+        match r.mouse_click(MouseButton::Left).await {
+            Err(InputError::NotImplemented {
+                backend: "libei",
+                op: "mouse_click",
+            }) => {}
+            other => panic!("expected NotImplemented(libei, mouse_click), got {other:?}"),
+        }
+        match prev {
+            Some(v) => std::env::set_var(BACKEND_ENV, v),
+            None => std::env::remove_var(BACKEND_ENV),
+        }
     }
 }

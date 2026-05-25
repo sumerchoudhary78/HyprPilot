@@ -11,7 +11,9 @@ use hyprpilot_core::selector::{WindowSelector, WorkspaceRef};
 use hyprpilot_core::Connection;
 use hyprpilot_daemon::{client::DaemonClient, default_socket_path, protocol::Request};
 use hyprpilot_input::keys::{KeyCombo, MouseButton};
-use hyprpilot_vision::{GrimCapture, ImageFormat, Psm, Region, TesseractOcr};
+use hyprpilot_vision::{
+    find_word_runs, BBox, GrimCapture, ImageFormat, Psm, Region, TesseractOcr,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -77,6 +79,56 @@ enum Cmd {
     /// OCR via `tesseract`. Captures with `grim` then extracts text.
     #[command(subcommand)]
     Ocr(OcrCmd),
+    /// Find on-screen text matching a query; print matches + bboxes as JSON.
+    FindText(FindTextCmd),
+    /// Click on-screen text matching a query. Defaults to dry-run.
+    ClickText(ClickTextCmd),
+}
+
+#[derive(Args, Debug)]
+struct FindTextCmd {
+    /// Text to look for. Tokenized on whitespace; multi-word queries
+    /// match a run of consecutive OCR'd words.
+    query: String,
+    /// Optional region: x y w h (all four or none).
+    #[arg(long, allow_hyphen_values = true, num_args = 4, value_names = ["X", "Y", "W", "H"])]
+    region: Option<Vec<i32>>,
+    #[arg(long)]
+    case_sensitive: bool,
+    #[arg(long, default_value_t = 50)]
+    min_confidence: i32,
+    /// PSM mode: 3 (auto), 6 (single block), 7 (line), 11 (sparse, default).
+    #[arg(long, default_value_t = 11)]
+    psm: u8,
+    #[arg(long, default_value = "eng")]
+    lang: String,
+}
+
+#[derive(Args, Debug)]
+struct ClickTextCmd {
+    query: String,
+    #[arg(long, allow_hyphen_values = true, num_args = 4, value_names = ["X", "Y", "W", "H"])]
+    region: Option<Vec<i32>>,
+    #[arg(long)]
+    case_sensitive: bool,
+    #[arg(long, default_value_t = 50)]
+    min_confidence: i32,
+    #[arg(long, default_value_t = 11)]
+    psm: u8,
+    #[arg(long, default_value = "eng")]
+    lang: String,
+    /// left, right, middle, x1/back, x2/forward.
+    #[arg(long, default_value = "left")]
+    button: String,
+    /// Which match to click. Defaults to 0.
+    #[arg(long, default_value_t = 0)]
+    match_index: usize,
+    /// Without this, ambiguous matches abort.
+    #[arg(long)]
+    allow_ambiguous: bool,
+    /// Apply for real. Without this, prints what would be clicked and exits.
+    #[arg(long)]
+    apply: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -401,7 +453,130 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Input(i) => run_input_cmd(i, cli.daemon_socket.as_deref(), cli.json).await,
         Cmd::Capture(c) => run_capture_cmd(c).await,
         Cmd::Ocr(o) => run_ocr_cmd(o).await,
+        Cmd::FindText(f) => run_find_text_cmd(f, cli.json).await,
+        Cmd::ClickText(c) => run_click_text_cmd(c, cli.daemon_socket.as_deref(), cli.json).await,
     }
+}
+
+fn region_from_vec(parts: Option<Vec<i32>>) -> Result<Option<Region>> {
+    let Some(v) = parts else { return Ok(None) };
+    if v.len() != 4 {
+        return Err(anyhow!("--region needs exactly 4 values: X Y W H"));
+    }
+    let (x, y, w, h) = (v[0], v[1], v[2], v[3]);
+    if w <= 0 || h <= 0 {
+        return Err(anyhow!("--region width/height must be > 0; got {w}x{h}"));
+    }
+    Ok(Some(Region { x, y, w: w as u32, h: h as u32 }))
+}
+
+async fn run_find_text_cmd(f: FindTextCmd, _json: bool) -> Result<()> {
+    let region = region_from_vec(f.region)?;
+    let psm = parse_psm(f.psm).map_err(|e| anyhow!(e))?;
+    let cap = GrimCapture::detect()?;
+    let bytes = match region {
+        Some(r) => cap.region(r, ImageFormat::Png).await?,
+        None => cap.full(None, ImageFormat::Png).await?,
+    };
+    let ocr = TesseractOcr::detect()?
+        .with_lang(f.lang)
+        .with_psm(psm)
+        .with_min_confidence(f.min_confidence);
+    let words = ocr.extract_words(&bytes).await?;
+    let mut matches = find_word_runs(&words, &f.query, f.case_sensitive);
+    if let Some(r) = region {
+        for m in &mut matches {
+            m.bbox = BBox { x: m.bbox.x + r.x, y: m.bbox.y + r.y, w: m.bbox.w, h: m.bbox.h };
+        }
+    }
+    let body = serde_json::json!({ "query": f.query, "match_count": matches.len(), "matches": matches });
+    println!("{}", serde_json::to_string_pretty(&body)?);
+    Ok(())
+}
+
+async fn run_click_text_cmd(
+    c: ClickTextCmd,
+    socket: Option<&std::path::Path>,
+    _json: bool,
+) -> Result<()> {
+    let region = region_from_vec(c.region)?;
+    let psm = parse_psm(c.psm).map_err(|e| anyhow!(e))?;
+    let button = MouseButton::parse(&c.button).map_err(|e| anyhow!(e))?;
+
+    let cap = GrimCapture::detect()?;
+    let bytes = match region {
+        Some(r) => cap.region(r, ImageFormat::Png).await?,
+        None => cap.full(None, ImageFormat::Png).await?,
+    };
+    let ocr = TesseractOcr::detect()?
+        .with_lang(c.lang)
+        .with_psm(psm)
+        .with_min_confidence(c.min_confidence);
+    let words = ocr.extract_words(&bytes).await?;
+    let mut matches = find_word_runs(&words, &c.query, c.case_sensitive);
+    if let Some(r) = region {
+        for m in &mut matches {
+            m.bbox = BBox { x: m.bbox.x + r.x, y: m.bbox.y + r.y, w: m.bbox.w, h: m.bbox.h };
+        }
+    }
+
+    if matches.is_empty() {
+        return Err(anyhow!("no on-screen text matched `{}`", c.query));
+    }
+    if !c.allow_ambiguous && matches.len() > 1 && c.match_index == 0 {
+        let summary = matches
+            .iter()
+            .enumerate()
+            .take(8)
+            .map(|(i, m)| {
+                format!(
+                    "  [{i}] `{}` at ({},{}) {}x{} conf={}",
+                    m.text, m.bbox.x, m.bbox.y, m.bbox.w, m.bbox.h, m.confidence
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(anyhow!(
+            "ambiguous: `{}` matched {} regions. Pass --match-index N or --allow-ambiguous:\n{summary}",
+            c.query,
+            matches.len()
+        ));
+    }
+    if c.match_index >= matches.len() {
+        return Err(anyhow!(
+            "--match-index {} out of bounds: only {} match(es)",
+            c.match_index,
+            matches.len()
+        ));
+    }
+    let chosen = &matches[c.match_index];
+    let (cx, cy) = chosen.bbox.center();
+
+    if !c.apply {
+        println!(
+            "[dry_run] would {button:?}-click `{}` at compositor ({cx}, {cy}) \
+             (bbox {},{} {}x{}, conf {}, match {}/{}).\n\
+             Pass --apply to click for real.",
+            chosen.text,
+            chosen.bbox.x, chosen.bbox.y, chosen.bbox.w, chosen.bbox.h,
+            chosen.confidence,
+            c.match_index, matches.len(),
+        );
+        return Ok(());
+    }
+
+    let mut client = open_daemon(socket).await?;
+    let _: serde_json::Value = client
+        .call(Request::InputMouseMove { x: cx, y: cy, absolute: true })
+        .await?;
+    let _: serde_json::Value = client.call(Request::InputMouseClick { button }).await?;
+    let body = serde_json::json!({
+        "clicked": chosen,
+        "click_at": { "x": cx, "y": cy },
+        "total_matches": matches.len(),
+    });
+    println!("{}", serde_json::to_string_pretty(&body)?);
+    Ok(())
 }
 
 async fn run_capture_cmd(c: CaptureCmd) -> Result<()> {

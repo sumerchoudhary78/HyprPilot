@@ -12,3 +12,13 @@ tokio = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# libei backend (v0.7 scaffold — not yet wired up). `reis` is the only
+# pure-Rust libei/EIS implementation on crates.io.
+reis = { version = "0.6", optional = true, features = ["tokio"] }
+
+[features]
+default = []
+# Compile in the libei backend stub. The default backend remains
+# wtype + ydotool either way; this flag only makes the libei code path
+# *available* for selection via `HYPRPILOT_INPUT_BACKEND=libei`.
+libei = ["dep:reis"]

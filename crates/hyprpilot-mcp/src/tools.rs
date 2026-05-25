@@ -29,6 +29,22 @@ use hyprpilot_daemon::protocol::Request;
 use hyprpilot_input::keys::{KeyCombo, MouseButton};
 use hyprpilot_vision::{ImageFormat as VisionImageFormat, Psm, Region};
 
+/// Default tesseract word-confidence floor for the composite vision tools.
+/// 50/100 drops obvious noise (single-pixel blobs scored near zero) but
+/// keeps anti-aliased text and font hinting glitches that score 50-70.
+/// Callers can override via the `min_confidence` arg.
+fn default_min_confidence() -> i32 {
+    50
+}
+
+/// PSM default for composite tools that *scan* a screenshot for a target
+/// string. `SparseText` (11) handles UI layouts where labels are scattered
+/// across whitespace; the per-block default (6) over-segments and loses
+/// labels that aren't part of a single contiguous block.
+fn default_scan_psm() -> u8 {
+    11
+}
+
 use crate::capability::ToolGroup;
 
 // =============================================================================
@@ -62,6 +78,13 @@ pub enum Dispatch {
     Capture(CaptureOp),
     /// OCR a captured image. Same daemon-bypass reasoning as `Capture`.
     Ocr(OcrOp),
+    /// Composite: capture + OCR + filter to `query` matches. Daemon-bypass
+    /// for the same reason `Ocr` is.
+    FindText(FindTextOp),
+    /// Composite: capture + OCR + filter + optionally drive the mouse
+    /// (via the daemon's input RPCs). Both vision and input touch points
+    /// live here so the server can handle them in one place.
+    ClickText(ClickTextOp),
 }
 
 /// What to capture and how. Image format is resolved here so we don't pass
@@ -89,6 +112,33 @@ pub enum OcrOp {
     Screen { lang: String, psm: Psm },
     /// OCR a specific region.
     Region { region: Region, lang: String, psm: Psm },
+}
+
+/// What to scan for. `region=None` means full screen.
+#[derive(Debug)]
+pub struct FindTextOp {
+    pub query: String,
+    pub region: Option<Region>,
+    pub case_sensitive: bool,
+    pub min_confidence: i32,
+    pub psm: Psm,
+    pub lang: String,
+}
+
+/// What to click. Same fields as [`FindTextOp`] plus the click-side
+/// controls. `button=None` defaults to left at the server layer.
+#[derive(Debug)]
+pub struct ClickTextOp {
+    pub query: String,
+    pub region: Option<Region>,
+    pub case_sensitive: bool,
+    pub min_confidence: i32,
+    pub psm: Psm,
+    pub lang: String,
+    pub button: hyprpilot_input::keys::MouseButton,
+    pub match_index: usize,
+    pub require_unique: bool,
+    pub dry_run: bool,
 }
 
 /// Parameter-parsing or validation failure.
@@ -435,6 +485,80 @@ fn parse_psm(tool: &str, n: u8) -> Result<Psm, DispatchError> {
             ),
         }),
     }
+}
+
+/// Inputs to the composite `find_text_position` tool. Search a region (or
+/// the full screen) for word runs that match `query` and return their
+/// bboxes in compositor coordinates.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct FindTextPositionArgs {
+    /// Text to search for. Tokenized on whitespace; multi-token queries
+    /// match a run of consecutive tesseract words (e.g. `"Save File"`
+    /// matches a row that tesseract split into two words).
+    pub query: String,
+    /// Optional region. When unset, searches the whole compositor.
+    /// Coordinates may be negative (multi-monitor layouts).
+    #[serde(default)]
+    pub x: Option<i32>,
+    #[serde(default)]
+    pub y: Option<i32>,
+    #[serde(default)]
+    pub w: Option<u32>,
+    #[serde(default)]
+    pub h: Option<u32>,
+    /// Case-sensitive match. Defaults to false.
+    #[serde(default)]
+    pub case_sensitive: bool,
+    /// Drop tesseract words scoring below this 0-100 confidence.
+    /// Default 50. Lower to catch faint text; raise to suppress noise.
+    #[serde(default = "default_min_confidence")]
+    pub min_confidence: i32,
+    /// Tesseract page-segmentation mode. 3 (auto), 6 (single block),
+    /// 7 (single line), 11 (sparse text, default for scanning).
+    #[serde(default = "default_scan_psm")]
+    pub psm: u8,
+    /// Tesseract language code (e.g. `eng`, `eng+fra`). Default `eng`.
+    #[serde(default = "default_lang")]
+    pub lang: String,
+}
+
+/// Inputs to the composite `click_text` tool. Superset of
+/// [`FindTextPositionArgs`] plus button + dispatch controls.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ClickTextArgs {
+    pub query: String,
+    #[serde(default)]
+    pub x: Option<i32>,
+    #[serde(default)]
+    pub y: Option<i32>,
+    #[serde(default)]
+    pub w: Option<u32>,
+    #[serde(default)]
+    pub h: Option<u32>,
+    #[serde(default)]
+    pub case_sensitive: bool,
+    #[serde(default = "default_min_confidence")]
+    pub min_confidence: i32,
+    #[serde(default = "default_scan_psm")]
+    pub psm: u8,
+    #[serde(default = "default_lang")]
+    pub lang: String,
+    /// `left` (default), `right`, `middle`, `x1`/`back`, `x2`/`forward`.
+    #[serde(default)]
+    pub button: Option<String>,
+    /// Which match to click if `query` is ambiguous. Default 0.
+    #[serde(default)]
+    pub match_index: Option<usize>,
+    /// Fail loudly if more than one match was found and the caller did
+    /// not pin `match_index`. Default true — prefer "explain the
+    /// ambiguity" over "click whatever". Set to false to take the first
+    /// match silently.
+    #[serde(default = "default_true")]
+    pub require_unique: bool,
+    /// When true (default), do not move/click. Return what WOULD be
+    /// clicked plus the centre coordinates. Pass `false` to apply.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -836,6 +960,38 @@ pub fn registry() -> Vec<ToolDef> {
              over it. Useful for reading a single dialog or panel without \
              OCR noise from the rest of the screen.",
         ),
+        def::<FindTextPositionArgs>(
+            "find_text_position",
+            Vision,
+            false,
+            "Capture the screen (or a region) and find on-screen text \
+             matching `query`. Returns an array of matches with the \
+             bounding box (in compositor pixel coordinates) and \
+             tesseract confidence for each. Multi-word queries match a \
+             run of consecutive OCR'd words. Read-only. Useful as the \
+             first half of click-by-label flows.",
+        ),
+        // click_text needs vision (it scans) AND input (it dispatches a \
+        // mouse click). The capability system tags each tool with exactly \
+        // one group; we tag this with `Input` because that is the \
+        // strictly more privileged surface — anyone allowed to use \
+        // `click_text` could already screenshot via the vision tools, \
+        // but the inverse is not true.
+        def::<ClickTextArgs>(
+            "click_text",
+            Input,
+            true,
+            "Scan the screen (or a region) for text matching `query` and \
+             click the centre of the first match. Composite of \
+             `find_text_position` + `input_mouse_move` + \
+             `input_mouse_click`. dry_run defaults to true: returns the \
+             match and target coordinates without moving the cursor. \
+             VERY DANGEROUS for the same reasons as `input_mouse_click` \
+             — OCR noise or off-by-one matches can fire a click in an \
+             unexpected place. Requires the `input` capability group \
+             (NOT in the default profile) and the daemon's \
+             HYPRPILOT_DANGEROUS_INPUT_OK=1 gate.",
+        ),
     ]
 }
 
@@ -1108,7 +1264,87 @@ pub fn dispatch(name: &str, args: Value) -> Result<Dispatch, DispatchError> {
             Ok(Dispatch::Ocr(OcrOp::Region { region, lang: p.lang, psm }))
         }
 
+        "find_text_position" => {
+            let p: FindTextPositionArgs = parse_args(name, args)?;
+            if p.query.trim().is_empty() {
+                return Err(DispatchError::InvalidArgs {
+                    tool: name.to_string(),
+                    message: "query must not be empty".into(),
+                });
+            }
+            let region = build_optional_region(name, p.x, p.y, p.w, p.h)?;
+            let psm = parse_psm(name, p.psm)?;
+            Ok(Dispatch::FindText(FindTextOp {
+                query: p.query,
+                region,
+                case_sensitive: p.case_sensitive,
+                min_confidence: p.min_confidence,
+                psm,
+                lang: p.lang,
+            }))
+        }
+
+        "click_text" => {
+            let p: ClickTextArgs = parse_args(name, args)?;
+            if p.query.trim().is_empty() {
+                return Err(DispatchError::InvalidArgs {
+                    tool: name.to_string(),
+                    message: "query must not be empty".into(),
+                });
+            }
+            let region = build_optional_region(name, p.x, p.y, p.w, p.h)?;
+            let psm = parse_psm(name, p.psm)?;
+            let button = match p.button.as_deref() {
+                None => MouseButton::Left,
+                Some(s) => MouseButton::parse(s).map_err(|e| {
+                    DispatchError::InvalidArgs {
+                        tool: name.to_string(),
+                        message: e.to_string(),
+                    }
+                })?,
+            };
+            Ok(Dispatch::ClickText(ClickTextOp {
+                query: p.query,
+                region,
+                case_sensitive: p.case_sensitive,
+                min_confidence: p.min_confidence,
+                psm,
+                lang: p.lang,
+                button,
+                match_index: p.match_index.unwrap_or(0),
+                require_unique: p.require_unique,
+                dry_run: p.dry_run,
+            }))
+        }
+
         other => Err(DispatchError::UnknownTool(other.to_string())),
+    }
+}
+
+/// Either all of (x, y, w, h) are present or none. Reject mixed inputs
+/// (e.g. just `x` with no `w`) — silently ignoring a partial region would
+/// surprise callers who think they're scanning a region.
+fn build_optional_region(
+    tool: &str,
+    x: Option<i32>,
+    y: Option<i32>,
+    w: Option<u32>,
+    h: Option<u32>,
+) -> Result<Option<Region>, DispatchError> {
+    match (x, y, w, h) {
+        (None, None, None, None) => Ok(None),
+        (Some(x), Some(y), Some(w), Some(h)) => {
+            let r = Region { x, y, w, h };
+            r.validate().map_err(|e| DispatchError::InvalidArgs {
+                tool: tool.to_string(),
+                message: e.to_string(),
+            })?;
+            Ok(Some(r))
+        }
+        _ => Err(DispatchError::InvalidArgs {
+            tool: tool.to_string(),
+            message: "region requires all of x, y, w, h (or none of them)".into(),
+        }),
     }
 }
 
@@ -1242,7 +1478,7 @@ mod tests {
     fn registry_count() {
         // Lock the surface so additions are deliberate. Update this number
         // intentionally when adding/removing tools.
-        assert_eq!(registry().len(), 45);
+        assert_eq!(registry().len(), 47);
     }
 
     #[test]
@@ -1254,6 +1490,7 @@ mod tests {
             "input_shortcut",
             "input_mouse_move",
             "input_mouse_click",
+            "click_text",
         ] {
             let t = reg
                 .iter()
@@ -1273,6 +1510,7 @@ mod tests {
             "input_shortcut",
             "input_mouse_move",
             "input_mouse_click",
+            "click_text",
         ] {
             assert!(
                 !p.allows(name, crate::capability::ToolGroup::Input),
@@ -1334,6 +1572,127 @@ mod tests {
             .as_str()
             .expect("dry_run description should be a string");
         assert!(!desc.is_empty(), "dry_run description should be non-empty");
+    }
+
+    #[test]
+    fn find_text_position_parses_minimal_args() {
+        let d = dispatch(
+            "find_text_position",
+            serde_json::json!({"query": "Save"}),
+        )
+        .unwrap();
+        match d {
+            Dispatch::FindText(op) => {
+                assert_eq!(op.query, "Save");
+                assert!(op.region.is_none());
+                assert!(!op.case_sensitive);
+                assert_eq!(op.min_confidence, 50);
+            }
+            other => panic!("expected FindText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn find_text_position_rejects_partial_region() {
+        let err = dispatch(
+            "find_text_position",
+            serde_json::json!({"query": "X", "x": 0, "y": 0}),
+        )
+        .unwrap_err();
+        assert!(matches!(err, DispatchError::InvalidArgs { .. }));
+    }
+
+    #[test]
+    fn find_text_position_rejects_empty_query() {
+        let err = dispatch(
+            "find_text_position",
+            serde_json::json!({"query": "   "}),
+        )
+        .unwrap_err();
+        assert!(matches!(err, DispatchError::InvalidArgs { .. }));
+    }
+
+    #[test]
+    fn find_text_position_accepts_full_region() {
+        let d = dispatch(
+            "find_text_position",
+            serde_json::json!({
+                "query": "Save",
+                "x": 100, "y": 200, "w": 400u32, "h": 300u32,
+                "psm": 6,
+            }),
+        )
+        .unwrap();
+        match d {
+            Dispatch::FindText(op) => {
+                let r = op.region.expect("region present");
+                assert_eq!((r.x, r.y, r.w, r.h), (100, 200, 400, 300));
+            }
+            other => panic!("expected FindText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn click_text_defaults_to_dry_run_preview_path() {
+        let d = dispatch(
+            "click_text",
+            serde_json::json!({"query": "OK"}),
+        )
+        .unwrap();
+        match d {
+            Dispatch::ClickText(op) => {
+                assert!(op.dry_run, "click_text MUST default to dry_run=true");
+                assert_eq!(op.match_index, 0);
+                assert!(op.require_unique);
+                assert!(matches!(op.button, hyprpilot_input::keys::MouseButton::Left));
+            }
+            other => panic!("expected ClickText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn click_text_apply_path_carries_dry_run_false() {
+        let d = dispatch(
+            "click_text",
+            serde_json::json!({"query": "OK", "dry_run": false, "button": "right"}),
+        )
+        .unwrap();
+        match d {
+            Dispatch::ClickText(op) => {
+                assert!(!op.dry_run);
+                assert!(matches!(op.button, hyprpilot_input::keys::MouseButton::Right));
+            }
+            other => panic!("expected ClickText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn click_text_rejects_bad_button() {
+        let err = dispatch(
+            "click_text",
+            serde_json::json!({"query": "OK", "button": "nonsense"}),
+        )
+        .unwrap_err();
+        assert!(matches!(err, DispatchError::InvalidArgs { .. }));
+    }
+
+    #[test]
+    fn click_text_registered_in_input_group() {
+        let reg = registry();
+        let t = reg.iter().find(|t| t.name == "click_text").expect("click_text in registry");
+        assert_eq!(t.group, crate::capability::ToolGroup::Input);
+        assert!(t.mutating);
+    }
+
+    #[test]
+    fn find_text_position_registered_in_vision_group() {
+        let reg = registry();
+        let t = reg
+            .iter()
+            .find(|t| t.name == "find_text_position")
+            .expect("find_text_position in registry");
+        assert_eq!(t.group, crate::capability::ToolGroup::Vision);
+        assert!(!t.mutating);
     }
 
     #[test]

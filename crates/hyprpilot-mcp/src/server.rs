@@ -17,9 +17,14 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, warn};
 
 use hyprpilot_core::snapshot::SnapshotRestorePreview;
+use hyprpilot_core::snapshot::{RestoreAction, SnapshotDiff};
+use hyprpilot_core::types::Monitor;
 use hyprpilot_daemon::client::{ClientError, DaemonClient};
 use hyprpilot_daemon::protocol::Request;
-use hyprpilot_vision::{GrimCapture, TesseractOcr};
+use hyprpilot_vision::{
+    find_word_runs, BBox, GrimCapture, ImageFormat as VisionImageFormat, Region, TesseractOcr,
+    TextMatch,
+};
 
 use crate::capability::Profile;
 use crate::protocol::{
@@ -27,7 +32,7 @@ use crate::protocol::{
     JsonRpcRequest, JsonRpcResponse, ListToolsResult, ServerCapabilities, ServerInfo, Tool,
     PROTOCOL_VERSION,
 };
-use crate::tools::{self, CaptureOp, Dispatch, DispatchError, OcrOp, ToolDef};
+use crate::tools::{self, CaptureOp, ClickTextOp, Dispatch, DispatchError, FindTextOp, OcrOp, ToolDef};
 
 pub struct Server {
     profile: Profile,
@@ -212,6 +217,123 @@ impl Server {
             }
             Dispatch::Capture(op) => handle_capture(id, op).await,
             Dispatch::Ocr(op) => handle_ocr(id, op).await,
+            Dispatch::FindText(op) => handle_find_text(id, op).await,
+            Dispatch::ClickText(op) => self.handle_click_text(id, op).await,
+        }
+    }
+
+    async fn handle_click_text(&mut self, id: Value, op: ClickTextOp) -> JsonRpcResponse {
+        // Stage 1: vision (daemon-bypass — capture + OCR run locally).
+        let matches = match scan_for_matches(
+            op.region.as_ref().copied(),
+            &op.query,
+            op.case_sensitive,
+            op.min_confidence,
+            op.psm,
+            &op.lang,
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => return tool_error(id, ErrorCode::ToolExecution, e),
+        };
+
+        if matches.is_empty() {
+            return tool_error(
+                id,
+                ErrorCode::ToolExecution,
+                format!("no on-screen text matched query `{}`", op.query),
+            );
+        }
+        let total = matches.len();
+        if op.require_unique && total > 1 && op.match_index == 0 {
+            // Match index defaulted but the result is ambiguous — bail.
+            let body = render_ambiguity(&op.query, &matches);
+            return tool_error(id, ErrorCode::ToolExecution, body);
+        }
+        if op.match_index >= total {
+            return tool_error(
+                id,
+                ErrorCode::InvalidParams,
+                format!(
+                    "match_index {} out of bounds: only {} match(es) for `{}`",
+                    op.match_index, total, op.query
+                ),
+            );
+        }
+        let chosen = &matches[op.match_index];
+
+        // OCR runs on grim's PHYSICAL-pixel image, but mouse_move takes
+        // LOGICAL compositor coords. On a 2x display they differ by the
+        // monitor's scale. Query monitors so we can map back.
+        let scale = match self.call_daemon(Request::QueryMonitors).await {
+            Ok(v) => match serde_json::from_value::<Vec<Monitor>>(v) {
+                Ok(ms) => pick_scale(&ms, op.region.as_ref()),
+                Err(e) => {
+                    return tool_error(
+                        id,
+                        ErrorCode::ToolExecution,
+                        format!("daemon returned malformed monitors: {e}"),
+                    );
+                }
+            },
+            Err(e) => {
+                self.daemon = None;
+                let (code, message) = classify_daemon_error(&e);
+                return tool_error(id, code, message);
+            }
+        };
+
+        // image-px → logical-px, then add region origin (already logical).
+        let (cx_img, cy_img) = chosen.bbox.center();
+        let cx_logical = ((cx_img as f64) / scale).round() as i32;
+        let cy_logical = ((cy_img as f64) / scale).round() as i32;
+        let (cx, cy) = match op.region {
+            Some(r) => (cx_logical + r.x, cy_logical + r.y),
+            None => (cx_logical, cy_logical),
+        };
+
+        if op.dry_run {
+            let body = render_click_preview(&op, chosen, total, cx, cy);
+            return JsonRpcResponse::ok(
+                id,
+                CallToolResult { content: vec![Content::text(body)], is_error: false },
+            );
+        }
+
+        // Stage 2: drive input via daemon. mouse_move first (absolute), then
+        // mouse_click. Either request can surface BackendMissing or
+        // DaemonNotReachable — the daemon's RPC error codes already
+        // distinguish them; we propagate via the standard `classify_daemon_error`.
+        if let Err(resp) =
+            self.run_input(id.clone(), Request::InputMouseMove { x: cx, y: cy, absolute: true }).await
+        {
+            return resp;
+        }
+        if let Err(resp) =
+            self.run_input(id.clone(), Request::InputMouseClick { button: op.button }).await
+        {
+            return resp;
+        }
+
+        let body = render_click_applied(chosen, total, cx, cy);
+        JsonRpcResponse::ok(
+            id,
+            CallToolResult { content: vec![Content::text(body)], is_error: false },
+        )
+    }
+
+    /// Forward an input request to the daemon; on failure synthesise the
+    /// outgoing JSON-RPC response and return it as `Err` so the caller
+    /// short-circuits the click chain.
+    async fn run_input(&mut self, id: Value, request: Request) -> Result<(), JsonRpcResponse> {
+        match self.call_daemon(request).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                self.daemon = None;
+                let (code, message) = classify_daemon_error(&e);
+                Err(tool_error(id, code, message))
+            }
         }
     }
 
@@ -321,6 +443,131 @@ impl Server {
     }
 }
 
+/// Capture (region or full screen), OCR for words, filter to query matches.
+/// Returns matches in *compositor* coordinates (translated from image space
+/// when a region was supplied). Errors are pre-formatted strings ready for
+/// `ToolExecution`.
+async fn scan_for_matches(
+    region: Option<Region>,
+    query: &str,
+    case_sensitive: bool,
+    min_confidence: i32,
+    psm: hyprpilot_vision::Psm,
+    lang: &str,
+) -> Result<Vec<TextMatch>, String> {
+    let cap = GrimCapture::detect().map_err(|e| e.to_string())?;
+    let bytes = match region {
+        Some(r) => cap.region(r, VisionImageFormat::Png).await,
+        None => cap.full(None, VisionImageFormat::Png).await,
+    }
+    .map_err(|e| e.to_string())?;
+
+    let ocr = TesseractOcr::detect()
+        .map_err(|e| e.to_string())?
+        .with_lang(lang)
+        .with_psm(psm)
+        .with_min_confidence(min_confidence);
+    let words = ocr.extract_words(&bytes).await.map_err(|e| e.to_string())?;
+
+    let mut matches = find_word_runs(&words, query, case_sensitive);
+    if let Some(r) = region {
+        for m in &mut matches {
+            m.bbox = BBox { x: m.bbox.x + r.x, y: m.bbox.y + r.y, w: m.bbox.w, h: m.bbox.h };
+        }
+    }
+    Ok(matches)
+}
+
+async fn handle_find_text(id: Value, op: FindTextOp) -> JsonRpcResponse {
+    match scan_for_matches(
+        op.region,
+        &op.query,
+        op.case_sensitive,
+        op.min_confidence,
+        op.psm,
+        &op.lang,
+    )
+    .await
+    {
+        Ok(matches) => {
+            let body = serde_json::json!({
+                "query": op.query,
+                "match_count": matches.len(),
+                "matches": matches,
+            });
+            JsonRpcResponse::ok(
+                id,
+                CallToolResult {
+                    content: vec![Content::text(
+                        serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string()),
+                    )],
+                    is_error: false,
+                },
+            )
+        }
+        Err(e) => tool_error(id, ErrorCode::ToolExecution, e),
+    }
+}
+
+fn render_click_preview(
+    op: &ClickTextOp,
+    chosen: &TextMatch,
+    total: usize,
+    cx: i32,
+    cy: i32,
+) -> String {
+    format!(
+        "[dry_run] click_text would {button:?}-click `{text}` at compositor ({cx}, {cy}) \
+         (bbox {x},{y} {w}x{h}, conf {conf}, match {idx}/{total}).\n\n\
+         Pass `dry_run: false` to apply.",
+        button = op.button,
+        text = chosen.text,
+        cx = cx,
+        cy = cy,
+        x = chosen.bbox.x,
+        y = chosen.bbox.y,
+        w = chosen.bbox.w,
+        h = chosen.bbox.h,
+        conf = chosen.confidence,
+        idx = op.match_index,
+        total = total,
+    )
+}
+
+fn render_click_applied(chosen: &TextMatch, total: usize, cx: i32, cy: i32) -> String {
+    let body = serde_json::json!({
+        "clicked": chosen,
+        "click_at": { "x": cx, "y": cy },
+        "total_matches": total,
+    });
+    serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string())
+}
+
+fn render_ambiguity(query: &str, matches: &[TextMatch]) -> String {
+    let mut out = format!(
+        "ambiguous: `{}` matched {} regions on screen. Pass `match_index` \
+         (0..{}) to pick one, or `require_unique: false` to take the first:\n",
+        query,
+        matches.len(),
+        matches.len().saturating_sub(1),
+    );
+    for (i, m) in matches.iter().enumerate().take(8) {
+        out.push_str(&format!(
+            "  [{i}] `{text}` at ({x},{y}) {w}x{h} conf={conf}\n",
+            text = m.text,
+            x = m.bbox.x,
+            y = m.bbox.y,
+            w = m.bbox.w,
+            h = m.bbox.h,
+            conf = m.confidence,
+        ));
+    }
+    if matches.len() > 8 {
+        out.push_str(&format!("  ... and {} more\n", matches.len() - 8));
+    }
+    out
+}
+
 fn tool_error(id: Value, code: ErrorCode, message: String) -> JsonRpcResponse {
     // MCP convention: tool-execution failures are returned as a *successful*
     // tools/call response with `isError: true`, not a JSON-RPC error. We use
@@ -360,6 +607,147 @@ fn render_dry_run_body(preview: &SnapshotRestorePreview) -> String {
         "[dry_run] {summary}\n\n{json}\n\nPass `dry_run: false` to apply.",
         summary = preview.human_summary,
     )
+/// Format a `SnapshotDiff` into a human-readable preview body for
+/// `snapshot_restore --dry-run`. Caps the action list at 10 lines; an
+/// agent that wants the full list can still call `snapshot_diff` directly.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// Pick the scale factor to convert OCR image-pixel coords back to
+/// compositor logical pixels. Preference order: the monitor containing
+/// the captured region's origin, then the focused monitor, then the
+/// first monitor, finally 1.0. Multi-monitor full-screen captures with
+/// mixed scales are not handled accurately — use a `region` to scope.
+fn pick_scale(monitors: &[Monitor], region: Option<&Region>) -> f64 {
+    if let Some(r) = region {
+        if let Some(m) = monitors.iter().find(|m| {
+            let logical_w = (m.width as f64 / m.scale).round() as i32;
+            let logical_h = (m.height as f64 / m.scale).round() as i32;
+            r.x >= m.x && r.x < m.x + logical_w && r.y >= m.y && r.y < m.y + logical_h
+        }) {
+            return m.scale;
+        }
+    }
+    monitors
+        .iter()
+        .find(|m| m.focused)
+        .or_else(|| monitors.first())
+        .map(|m| m.scale)
+        .unwrap_or(1.0)
+}
+
+fn render_restore_preview(name: &str, diff: &SnapshotDiff) -> String {
+    let mut moves = 0usize;
+    let mut floats = 0usize;
+    let mut repositions = 0usize;
+    let mut fullscreens = 0usize;
+    let mut pins = 0usize;
+    let mut refocus = 0usize;
+    let mut missing = 0usize;
+    let mut extra = 0usize;
+    for a in &diff.actions {
+        match a {
+            RestoreAction::MoveToWorkspace { .. } => moves += 1,
+            RestoreAction::ToggleFloating { .. } => floats += 1,
+            RestoreAction::RepositionFloating { .. } => repositions += 1,
+            RestoreAction::SetFullscreen { .. } => fullscreens += 1,
+            RestoreAction::SetPin { .. } => pins += 1,
+            RestoreAction::RestoreActiveFocus { .. } => refocus += 1,
+            RestoreAction::WindowMissing { .. } => missing += 1,
+            RestoreAction::WindowNotInSnapshot { .. } => extra += 1,
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!("[dry_run] would restore snapshot `{name}`:\n"));
+    out.push_str(&format!(
+        "  {moves} workspace move{}, {floats} float toggle{}, \
+         {repositions} reposition{}, {fullscreens} fullscreen change{}, \
+         {pins} pin toggle{}, {refocus} refocus, \
+         {missing} missing, {extra} not in snapshot\n",
+        plural(moves),
+        plural(floats),
+        plural(repositions),
+        plural(fullscreens),
+        plural(pins),
+    ));
+
+    if diff.mutation_count() == 0 {
+        out.push_str("  (no changes — current state already matches the snapshot)\n");
+    } else {
+        let mut shown = 0usize;
+        const LIMIT: usize = 10;
+        let mutating: Vec<&RestoreAction> = diff
+            .actions
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    RestoreAction::MoveToWorkspace { .. }
+                        | RestoreAction::ToggleFloating { .. }
+                        | RestoreAction::RepositionFloating { .. }
+                        | RestoreAction::SetFullscreen { .. }
+                        | RestoreAction::SetPin { .. }
+                        | RestoreAction::RestoreActiveFocus { .. }
+                )
+            })
+            .collect();
+        for a in mutating.iter().take(LIMIT) {
+            match a {
+                RestoreAction::MoveToWorkspace { address, to_workspace, .. } => {
+                    out.push_str(&format!(
+                        "  move address:{address} to workspace {to_workspace}\n"
+                    ));
+                }
+                RestoreAction::ToggleFloating { address, target } => {
+                    out.push_str(&format!(
+                        "  toggle floating address:{address} → {target}\n"
+                    ));
+                }
+                RestoreAction::RepositionFloating {
+                    address,
+                    target_at,
+                    target_size,
+                    ..
+                } => {
+                    out.push_str(&format!(
+                        "  reposition address:{address} → at=({},{}) size=({},{})\n",
+                        target_at[0], target_at[1], target_size[0], target_size[1]
+                    ));
+                }
+                RestoreAction::SetFullscreen { address, to_mode, .. } => {
+                    let label = match to_mode {
+                        0 => "none".to_string(),
+                        1 => "maximize".to_string(),
+                        2 => "fullscreen".to_string(),
+                        n => format!("mode {n}"),
+                    };
+                    out.push_str(&format!(
+                        "  fullscreen address:{address} → {label}\n"
+                    ));
+                }
+                RestoreAction::SetPin { address, target } => {
+                    out.push_str(&format!(
+                        "  pin address:{address} → {target}\n"
+                    ));
+                }
+                RestoreAction::RestoreActiveFocus { address, .. } => {
+                    out.push_str(&format!(
+                        "  refocus address:{address}\n"
+                    ));
+                }
+                _ => {}
+            }
+            shown += 1;
+        }
+        let total = mutating.len();
+        if total > shown {
+            out.push_str(&format!("  ... and {} more\n", total - shown));
+        }
+    }
+    out.push_str("\nPass `dry_run: false` to apply.");
+    out
 }
 
 /// Run a capture op and wrap the bytes in an MCP `image` content block.

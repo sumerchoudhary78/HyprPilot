@@ -25,6 +25,15 @@ pub enum InputError {
         stderr: String,
     },
 
+    #[error("input backend `{backend}` does not yet implement `{op}`")]
+    NotImplemented {
+        backend: &'static str,
+        op: &'static str,
+    },
+
+    #[error("invalid input-backend selection `{0}`")]
+    InvalidBackendSelection(String),
+
     #[error("I/O error invoking input backend: {0}")]
     Io(#[from] std::io::Error),
 }

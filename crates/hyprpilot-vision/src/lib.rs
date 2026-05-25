@@ -20,7 +20,7 @@ pub mod detect;
 pub mod error;
 pub mod ocr;
 
-pub use capture::{GrimCapture, ImageFormat, Region};
+pub use capture::{BBox, GrimCapture, ImageFormat, Region};
 pub use detect::BackendAvailability;
 pub use error::{Result, VisionError};
-pub use ocr::{Psm, TesseractOcr};
+pub use ocr::{find_word_runs, Psm, TesseractOcr, TextMatch, Word};
