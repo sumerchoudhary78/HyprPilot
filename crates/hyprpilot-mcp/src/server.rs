@@ -17,7 +17,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, warn};
 
 use hyprpilot_core::snapshot::SnapshotRestorePreview;
-use hyprpilot_core::snapshot::{RestoreAction, SnapshotDiff};
 use hyprpilot_core::types::Monitor;
 use hyprpilot_daemon::client::{ClientError, DaemonClient};
 use hyprpilot_daemon::protocol::Request;
@@ -582,18 +581,6 @@ fn tool_error(id: Value, code: ErrorCode, message: String) -> JsonRpcResponse {
     }
 }
 
-/// Map a daemon-side [`ClientError`] to an MCP error code + message.
-///
-/// Validation-class daemon codes (bad agent input that happened to be caught
-/// at the daemon boundary, not in the MCP arg parser) are surfaced as
-/// JSON-RPC `InvalidParams` so they look the same to the agent as MCP-layer
-/// arg validation. Runtime-class codes (Hyprland rejected the dispatch, undo
-/// stack empty, snapshot I/O, etc.) stay as `ToolExecution` and surface as
-/// `isError` content, since they're not the agent's fault to fix by tweaking
-/// its arguments.
-///
-/// The daemon's structured code is preserved as a `[code]` prefix in the
-/// message so the agent and humans can still see exactly what failed.
 /// Format a [`SnapshotRestorePreview`] for the MCP dry-run response.
 ///
 /// The body is the human summary on the first line, followed by the full
@@ -607,11 +594,6 @@ fn render_dry_run_body(preview: &SnapshotRestorePreview) -> String {
         "[dry_run] {summary}\n\n{json}\n\nPass `dry_run: false` to apply.",
         summary = preview.human_summary,
     )
-/// Format a `SnapshotDiff` into a human-readable preview body for
-/// `snapshot_restore --dry-run`. Caps the action list at 10 lines; an
-/// agent that wants the full list can still call `snapshot_diff` directly.
-fn plural(n: usize) -> &'static str {
-    if n == 1 { "" } else { "s" }
 }
 
 /// Pick the scale factor to convert OCR image-pixel coords back to
@@ -635,119 +617,6 @@ fn pick_scale(monitors: &[Monitor], region: Option<&Region>) -> f64 {
         .or_else(|| monitors.first())
         .map(|m| m.scale)
         .unwrap_or(1.0)
-}
-
-fn render_restore_preview(name: &str, diff: &SnapshotDiff) -> String {
-    let mut moves = 0usize;
-    let mut floats = 0usize;
-    let mut repositions = 0usize;
-    let mut fullscreens = 0usize;
-    let mut pins = 0usize;
-    let mut refocus = 0usize;
-    let mut missing = 0usize;
-    let mut extra = 0usize;
-    for a in &diff.actions {
-        match a {
-            RestoreAction::MoveToWorkspace { .. } => moves += 1,
-            RestoreAction::ToggleFloating { .. } => floats += 1,
-            RestoreAction::RepositionFloating { .. } => repositions += 1,
-            RestoreAction::SetFullscreen { .. } => fullscreens += 1,
-            RestoreAction::SetPin { .. } => pins += 1,
-            RestoreAction::RestoreActiveFocus { .. } => refocus += 1,
-            RestoreAction::WindowMissing { .. } => missing += 1,
-            RestoreAction::WindowNotInSnapshot { .. } => extra += 1,
-        }
-    }
-
-    let mut out = String::new();
-    out.push_str(&format!("[dry_run] would restore snapshot `{name}`:\n"));
-    out.push_str(&format!(
-        "  {moves} workspace move{}, {floats} float toggle{}, \
-         {repositions} reposition{}, {fullscreens} fullscreen change{}, \
-         {pins} pin toggle{}, {refocus} refocus, \
-         {missing} missing, {extra} not in snapshot\n",
-        plural(moves),
-        plural(floats),
-        plural(repositions),
-        plural(fullscreens),
-        plural(pins),
-    ));
-
-    if diff.mutation_count() == 0 {
-        out.push_str("  (no changes — current state already matches the snapshot)\n");
-    } else {
-        let mut shown = 0usize;
-        const LIMIT: usize = 10;
-        let mutating: Vec<&RestoreAction> = diff
-            .actions
-            .iter()
-            .filter(|a| {
-                matches!(
-                    a,
-                    RestoreAction::MoveToWorkspace { .. }
-                        | RestoreAction::ToggleFloating { .. }
-                        | RestoreAction::RepositionFloating { .. }
-                        | RestoreAction::SetFullscreen { .. }
-                        | RestoreAction::SetPin { .. }
-                        | RestoreAction::RestoreActiveFocus { .. }
-                )
-            })
-            .collect();
-        for a in mutating.iter().take(LIMIT) {
-            match a {
-                RestoreAction::MoveToWorkspace { address, to_workspace, .. } => {
-                    out.push_str(&format!(
-                        "  move address:{address} to workspace {to_workspace}\n"
-                    ));
-                }
-                RestoreAction::ToggleFloating { address, target } => {
-                    out.push_str(&format!(
-                        "  toggle floating address:{address} → {target}\n"
-                    ));
-                }
-                RestoreAction::RepositionFloating {
-                    address,
-                    target_at,
-                    target_size,
-                    ..
-                } => {
-                    out.push_str(&format!(
-                        "  reposition address:{address} → at=({},{}) size=({},{})\n",
-                        target_at[0], target_at[1], target_size[0], target_size[1]
-                    ));
-                }
-                RestoreAction::SetFullscreen { address, to_mode, .. } => {
-                    let label = match to_mode {
-                        0 => "none".to_string(),
-                        1 => "maximize".to_string(),
-                        2 => "fullscreen".to_string(),
-                        n => format!("mode {n}"),
-                    };
-                    out.push_str(&format!(
-                        "  fullscreen address:{address} → {label}\n"
-                    ));
-                }
-                RestoreAction::SetPin { address, target } => {
-                    out.push_str(&format!(
-                        "  pin address:{address} → {target}\n"
-                    ));
-                }
-                RestoreAction::RestoreActiveFocus { address, .. } => {
-                    out.push_str(&format!(
-                        "  refocus address:{address}\n"
-                    ));
-                }
-                _ => {}
-            }
-            shown += 1;
-        }
-        let total = mutating.len();
-        if total > shown {
-            out.push_str(&format!("  ... and {} more\n", total - shown));
-        }
-    }
-    out.push_str("\nPass `dry_run: false` to apply.");
-    out
 }
 
 /// Run a capture op and wrap the bytes in an MCP `image` content block.
@@ -817,6 +686,18 @@ async fn handle_ocr(id: Value, op: OcrOp) -> JsonRpcResponse {
     }
 }
 
+/// Map a daemon-side [`ClientError`] to an MCP error code + message.
+///
+/// Validation-class daemon codes (bad agent input that happened to be caught
+/// at the daemon boundary, not in the MCP arg parser) are surfaced as
+/// JSON-RPC `InvalidParams` so they look the same to the agent as MCP-layer
+/// arg validation. Runtime-class codes (Hyprland rejected the dispatch, undo
+/// stack empty, snapshot I/O, etc.) stay as `ToolExecution` and surface as
+/// `isError` content, since they're not the agent's fault to fix by tweaking
+/// its arguments.
+///
+/// The daemon's structured code is preserved as a `[code]` prefix in the
+/// message so the agent and humans can still see exactly what failed.
 fn classify_daemon_error(e: &ClientError) -> (ErrorCode, String) {
     match e {
         ClientError::Rpc { code, message } => {
