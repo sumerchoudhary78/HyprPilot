@@ -8,6 +8,8 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+use hyprpilot_core::snapshot::SnapshotRestorePreview;
+
 use crate::protocol::{Request, RequestEnvelope, Response, ResponseEnvelope, RpcError};
 
 #[derive(Debug, Error)]
@@ -58,6 +60,15 @@ impl DaemonClient {
     pub async fn call_void(&mut self, request: Request) -> Result<(), ClientError> {
         let _ = self.call_raw(request).await?;
         Ok(())
+    }
+
+    /// Fetch the rich [`SnapshotRestorePreview`] for the named snapshot.
+    /// Thin wrapper over `call::<SnapshotRestorePreview>(SnapshotPreview)`.
+    pub async fn snapshot_preview(
+        &mut self,
+        name: impl Into<String>,
+    ) -> Result<SnapshotRestorePreview, ClientError> {
+        self.call(Request::SnapshotPreview { name: name.into() }).await
     }
 
     async fn call_raw(&mut self, request: Request) -> Result<serde_json::Value, ClientError> {

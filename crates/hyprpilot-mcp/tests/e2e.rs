@@ -487,13 +487,21 @@ async fn snapshot_restore_dry_run_includes_diff_summary() {
     let text = result["content"][0]["text"].as_str().expect("text content");
     assert!(text.starts_with("[dry_run]"), "expected dry_run preview, got: {text}");
     assert!(
-        text.contains("would restore snapshot"),
-        "preview missing action phrase: {text}"
+        text.contains("No changes"),
+        "self-restore should report no changes, got: {text}"
     );
     assert!(text.contains(&snap_name), "preview missing snapshot name: {text}");
     assert!(
-        text.contains("(no changes"),
-        "self-restore should report no changes, got: {text}"
+        text.contains("\"summary\""),
+        "preview missing structured summary field: {text}"
+    );
+    assert!(
+        text.contains("\"will_apply\""),
+        "preview missing will_apply field: {text}"
+    );
+    assert!(
+        text.contains("\"will_skip\""),
+        "preview missing will_skip field: {text}"
     );
     assert!(
         text.contains("Pass `dry_run: false` to apply."),

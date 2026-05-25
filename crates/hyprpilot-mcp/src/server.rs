@@ -16,6 +16,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, warn};
 
+use hyprpilot_core::snapshot::SnapshotRestorePreview;
 use hyprpilot_core::snapshot::{RestoreAction, SnapshotDiff};
 use hyprpilot_core::types::Monitor;
 use hyprpilot_daemon::client::{ClientError, DaemonClient};
@@ -336,12 +337,15 @@ impl Server {
         }
     }
 
-    /// Dry-run preview for `snapshot_restore`: fetch the diff from the daemon
-    /// and render the action list inline. On any daemon error (notably
-    /// `snapshot_not_found`), propagate via the normal error path so the
-    /// agent sees the same JSON-RPC codes it would for a non-dry-run call.
+    /// Dry-run preview for `snapshot_restore`: fetch the rich preview from
+    /// the daemon and emit it as a single JSON content block. The agent
+    /// gets the human-readable summary, the per-category counts, and the
+    /// full action list in one tool call — no separate `snapshot_diff`
+    /// round-trip needed. On any daemon error (notably `snapshot_not_found`),
+    /// propagate via the normal error path so the agent sees the same
+    /// JSON-RPC codes it would for a non-dry-run call.
     async fn preview_snapshot_restore(&mut self, id: Value, name: String) -> JsonRpcResponse {
-        let value = match self.call_daemon(Request::SnapshotDiff { name: name.clone() }).await {
+        let value = match self.call_daemon(Request::SnapshotPreview { name }).await {
             Ok(v) => v,
             Err(e) => {
                 self.daemon = None;
@@ -349,17 +353,17 @@ impl Server {
                 return tool_error(id, code, message);
             }
         };
-        let diff: SnapshotDiff = match serde_json::from_value(value) {
-            Ok(d) => d,
+        let preview: SnapshotRestorePreview = match serde_json::from_value(value) {
+            Ok(p) => p,
             Err(e) => {
                 return tool_error(
                     id,
                     ErrorCode::ToolExecution,
-                    format!("daemon returned malformed snapshot diff: {e}"),
+                    format!("daemon returned malformed snapshot preview: {e}"),
                 );
             }
         };
-        let body = render_restore_preview(&name, &diff);
+        let body = render_dry_run_body(&preview);
         JsonRpcResponse::ok(
             id,
             CallToolResult { content: vec![Content::text(body)], is_error: false },
@@ -590,6 +594,19 @@ fn tool_error(id: Value, code: ErrorCode, message: String) -> JsonRpcResponse {
 ///
 /// The daemon's structured code is preserved as a `[code]` prefix in the
 /// message so the agent and humans can still see exactly what failed.
+/// Format a [`SnapshotRestorePreview`] for the MCP dry-run response.
+///
+/// The body is the human summary on the first line, followed by the full
+/// preview as pretty-printed JSON so an agent can drill into `will_apply`
+/// / `will_skip` / per-action details without a second tool call. Closes
+/// with a one-line reminder to pass `dry_run: false` to apply.
+fn render_dry_run_body(preview: &SnapshotRestorePreview) -> String {
+    let json = serde_json::to_string_pretty(preview)
+        .unwrap_or_else(|_| "{}".to_string());
+    format!(
+        "[dry_run] {summary}\n\n{json}\n\nPass `dry_run: false` to apply.",
+        summary = preview.human_summary,
+    )
 /// Format a `SnapshotDiff` into a human-readable preview body for
 /// `snapshot_restore --dry-run`. Caps the action list at 10 lines; an
 /// agent that wants the full list can still call `snapshot_diff` directly.

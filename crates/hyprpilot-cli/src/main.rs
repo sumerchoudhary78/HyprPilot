@@ -688,10 +688,13 @@ async fn run_snapshot_cmd(
     json: bool,
 ) -> Result<()> {
     let mut client = open_daemon(socket).await?;
+    // `Diff` uses the rich preview RPC so the CLI shows the same plain-English
+    // summary the MCP tool surfaces. Other subcommands stay on their existing
+    // RPCs; their JSON shapes are unchanged.
     let (req, label) = match s {
         SnapshotCmd::Save { name } => (Request::SnapshotSave { name: name.clone() }, name),
         SnapshotCmd::List => (Request::SnapshotList, "list".to_string()),
-        SnapshotCmd::Diff { name } => (Request::SnapshotDiff { name: name.clone() }, name),
+        SnapshotCmd::Diff { name } => (Request::SnapshotPreview { name: name.clone() }, name),
         SnapshotCmd::Restore { name } => (Request::SnapshotRestore { name: name.clone() }, name),
         SnapshotCmd::Delete { name } => (Request::SnapshotDelete { name: name.clone() }, name),
     };
@@ -704,6 +707,25 @@ async fn run_snapshot_cmd(
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
                 .join("\n")
+        }
+        serde_json::Value::Object(obj) if obj.contains_key("human_summary") => {
+            // snapshot preview (from `snapshot diff` or `snapshot restore`):
+            // surface the human summary at the top, then the JSON.
+            let summary = obj
+                .get("human_summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!("{summary}\n\n{}", pretty(&v))
+        }
+        serde_json::Value::Object(obj) if obj.contains_key("preview") => {
+            // snapshot_restore wrapped response: dig out the embedded preview's
+            // human_summary for the headline line.
+            let summary = obj
+                .get("preview")
+                .and_then(|p| p.get("human_summary"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!("{summary}\n\n{}", pretty(&v))
         }
         _ => pretty(&v),
     };
