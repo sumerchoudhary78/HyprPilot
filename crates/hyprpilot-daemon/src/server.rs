@@ -254,6 +254,7 @@ async fn handle_request(state: &State, req: Request) -> Response {
         Request::QueryActiveWorkspace => from_core(state.hypr.active_workspace().await),
         Request::QueryVersion => from_core(state.hypr.version().await),
         Request::QueryCursorPos => from_core(state.hypr.cursor_position().await),
+        Request::QueryBinds => from_core(state.hypr.binds().await),
 
         // ---- mutating, recorded for undo -----------------------------------
         Request::DispatchKillActive => kill_active_recorded(state).await,

@@ -289,6 +289,8 @@ enum QueryCmd {
     ActiveWorkspace,
     Version,
     CursorPos,
+    /// List the user's keybinds (live from Hyprland) with decoded modifiers.
+    Binds,
 }
 
 #[derive(Subcommand, Debug)]
@@ -809,6 +811,7 @@ async fn run_query(
             QueryCmd::ActiveWorkspace => Request::QueryActiveWorkspace,
             QueryCmd::Version => Request::QueryVersion,
             QueryCmd::CursorPos => Request::QueryCursorPos,
+            QueryCmd::Binds => Request::QueryBinds,
         };
         let v: serde_json::Value = client.call(req).await?;
         return emit_json_or_text(json, &v, &pretty(&v));
@@ -822,6 +825,7 @@ async fn run_query(
         QueryCmd::ActiveWorkspace => emit(json, &conn.active_workspace().await?),
         QueryCmd::Version => emit(json, &conn.version().await?),
         QueryCmd::CursorPos => emit(json, &conn.cursor_position().await?),
+        QueryCmd::Binds => emit(json, &conn.binds().await?),
     }
 }
 
