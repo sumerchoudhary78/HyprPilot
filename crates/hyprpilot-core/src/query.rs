@@ -24,6 +24,16 @@ impl Connection {
         self.query("monitors").await
     }
 
+    /// All configured keybinds. Hyprland doesn't send readable modifier
+    /// names, so we decode each `modmask` into [`Bind::mods`] here.
+    pub async fn binds(&self) -> Result<Vec<Bind>> {
+        let mut binds: Vec<Bind> = self.query("binds").await?;
+        for b in &mut binds {
+            b.mods = Bind::decode_mods(b.modmask);
+        }
+        Ok(binds)
+    }
+
     pub async fn active_workspace(&self) -> Result<ActiveWorkspace> {
         self.query("activeworkspace").await
     }

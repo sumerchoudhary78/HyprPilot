@@ -6,6 +6,98 @@
 
 use serde::{Deserialize, Serialize};
 
+/// One keybind, as reported by Hyprland's `binds` query.
+///
+/// `modmask` is Hyprland's raw modifier bitmask; [`Bind::decode_mods`]
+/// turns it into the readable `mods` list (`["SUPER", "SHIFT"]`). `mods`
+/// is not part of Hyprland's JSON — [`crate::ipc::Connection::binds`]
+/// populates it after the query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bind {
+    /// Readable modifier names, derived from `modmask`. Empty until the
+    /// query layer fills it in.
+    #[serde(default)]
+    pub mods: Vec<String>,
+    pub modmask: u32,
+    /// Keysym, e.g. `T`, `Return`, `space`. Empty for keycode-only binds.
+    #[serde(default)]
+    pub key: String,
+    /// Raw evdev keycode, set instead of `key` for `bindcode`-style binds.
+    #[serde(default)]
+    pub keycode: i64,
+    /// Submap this bind belongs to; empty string is the global submap.
+    #[serde(default)]
+    pub submap: String,
+    pub dispatcher: String,
+    #[serde(default)]
+    pub arg: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub locked: bool,
+    #[serde(default)]
+    pub mouse: bool,
+    #[serde(default)]
+    pub release: bool,
+    #[serde(default)]
+    pub repeat: bool,
+}
+
+impl Bind {
+    /// Decode Hyprland's `modmask` into readable modifier names. Only the
+    /// modifiers that matter for chords are surfaced (`SHIFT`, `CTRL`,
+    /// `ALT`, `SUPER`); lock bits (Caps, NumLock) are ignored. Bit values
+    /// follow X11 / Hyprland: SHIFT=1, CTRL=4, ALT=8, SUPER=64.
+    pub fn decode_mods(modmask: u32) -> Vec<String> {
+        let mut mods = Vec::new();
+        if modmask & 1 != 0 {
+            mods.push("SHIFT".to_string());
+        }
+        if modmask & 4 != 0 {
+            mods.push("CTRL".to_string());
+        }
+        if modmask & 8 != 0 {
+            mods.push("ALT".to_string());
+        }
+        if modmask & 64 != 0 {
+            mods.push("SUPER".to_string());
+        }
+        mods
+    }
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::Bind;
+
+    #[test]
+    fn decode_mods_super_only() {
+        assert_eq!(Bind::decode_mods(64), vec!["SUPER"]);
+    }
+
+    #[test]
+    fn decode_mods_combinations() {
+        // 72 = SUPER(64) + ALT(8)
+        assert_eq!(Bind::decode_mods(72), vec!["ALT", "SUPER"]);
+        // 69 = SUPER(64) + CTRL(4) + SHIFT(1)
+        assert_eq!(Bind::decode_mods(69), vec!["SHIFT", "CTRL", "SUPER"]);
+        // 5 = CTRL(4) + SHIFT(1)
+        assert_eq!(Bind::decode_mods(5), vec!["SHIFT", "CTRL"]);
+    }
+
+    #[test]
+    fn decode_mods_none() {
+        assert!(Bind::decode_mods(0).is_empty());
+    }
+
+    #[test]
+    fn decode_mods_ignores_lock_bits() {
+        // CAPS(2) and NumLock/MOD2(16) are not chord modifiers.
+        assert!(Bind::decode_mods(2).is_empty());
+        assert_eq!(Bind::decode_mods(2 | 64), vec!["SUPER"]);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Version {
     pub branch: String,

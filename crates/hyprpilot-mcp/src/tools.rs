@@ -630,6 +630,17 @@ pub fn registry() -> Vec<ToolDef> {
             false,
             "Return the cursor's screen-space (x, y) position in pixels. Read-only.",
         ),
+        def::<NoArgs>(
+            "query_binds",
+            Read,
+            false,
+            "List the user's live Hyprland keybinds: decoded modifier names \
+             (`mods`: e.g. `[\"SUPER\"]`), key, dispatcher, and arg, plus submap \
+             and flags. Read from the running compositor (always current), so \
+             prefer this over parsing ~/.config/hypr or asking the user. Use it \
+             to discover what a chord does (e.g. find the terminal bind) before \
+             triggering it with `input_keys`. Read-only.",
+        ),
         // ---- Window state (group: window) ------------------------------------
         def::<SelectorArgs>(
             "focus_window",
@@ -1028,6 +1039,7 @@ pub fn dispatch(name: &str, args: Value) -> Result<Dispatch, DispatchError> {
         "query_active_workspace" => parse_no_args(name, args, Request::QueryActiveWorkspace),
         "query_version" => parse_no_args(name, args, Request::QueryVersion),
         "query_cursor_pos" => parse_no_args(name, args, Request::QueryCursorPos),
+        "query_binds" => parse_no_args(name, args, Request::QueryBinds),
         "undo_list" => parse_no_args(name, args, Request::UndoList),
 
         // ---- mutating with selector ----------------------------------------
@@ -1478,7 +1490,7 @@ mod tests {
     fn registry_count() {
         // Lock the surface so additions are deliberate. Update this number
         // intentionally when adding/removing tools.
-        assert_eq!(registry().len(), 47);
+        assert_eq!(registry().len(), 48);
     }
 
     #[test]

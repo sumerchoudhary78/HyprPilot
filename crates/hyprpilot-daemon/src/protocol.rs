@@ -38,6 +38,7 @@ pub enum Request {
     QueryActiveWorkspace,
     QueryVersion,
     QueryCursorPos,
+    QueryBinds,
 
     DispatchKillActive,
     DispatchCloseWindow { selector: WindowSelector },
