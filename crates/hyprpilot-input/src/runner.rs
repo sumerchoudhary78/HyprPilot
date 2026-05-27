@@ -190,7 +190,44 @@ impl WtypeYdotoolBackend {
         finish("wtype", output)
     }
 
+    /// Press a key combo. Prefers ydotool: its events go through
+    /// uinput→libinput, so Hyprland's global bind matcher sees the chord
+    /// (`super+T` fires a `bind`). wtype's virtual-keyboard events are
+    /// filtered out of the bind matcher and reach only the focused client.
+    ///
+    /// Falls back to wtype when ydotool/ydotoold is unavailable, or when the
+    /// keysym has no Linux input-event-code in our table — the chord still
+    /// reaches the focused window, it just won't trigger compositor binds.
     async fn press_keys(&self, combo: &KeyCombo) -> Result<()> {
+        if let Some(ydotool) = self.backends.ydotool.as_ref() {
+            if self.backends.ydotoold_reachable() {
+                match combo.encode_ydotool_key() {
+                    Ok(argv) => return self.run_ydotool_key(ydotool, &argv).await,
+                    Err(e) => debug!(
+                        error = %e,
+                        "keysym has no evdev code; falling back to wtype for press_keys"
+                    ),
+                }
+            }
+        }
+        self.press_keys_wtype(combo).await
+    }
+
+    async fn run_ydotool_key(&self, ydotool: &std::path::Path, argv: &[String]) -> Result<()> {
+        debug!(argv = ?argv, "ydotool key combo");
+        let output = Command::new(ydotool)
+            .arg("key")
+            .args(argv)
+            .env("YDOTOOL_SOCKET", &self.backends.ydotoold_socket)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .await?;
+        finish("ydotool", output)
+    }
+
+    async fn press_keys_wtype(&self, combo: &KeyCombo) -> Result<()> {
         let wtype = self
             .backends
             .wtype
@@ -221,6 +258,7 @@ impl WtypeYdotoolBackend {
         debug!(argv = ?argv, "ydotool mousemove");
         let output = Command::new(ydotool)
             .args(&argv)
+            .env("YDOTOOL_SOCKET", &self.backends.ydotoold_socket)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -242,6 +280,7 @@ impl WtypeYdotoolBackend {
         debug!(button = ?button, code, "ydotool click");
         let output = Command::new(ydotool)
             .args(["click", code])
+            .env("YDOTOOL_SOCKET", &self.backends.ydotoold_socket)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

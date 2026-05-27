@@ -1,8 +1,36 @@
-# libei migration — design doc (v0.7 scaffold → v0.8 implementation)
+# libei migration — design doc
 
-Status: **scaffold landed in v0.7**. Backend trait + env-var selector +
-empty stub. No EIS bytes on the wire yet. v0.8 implements milestones
-M1–M6 below.
+> **STATUS (2026-05-27): SHELVED — blocked upstream, and unnecessary on
+> Hyprland.** The v0.7 scaffold (backend trait + env-var selector + empty
+> stub) stays in the tree, but M1–M6 are **not** being implemented. Two
+> findings killed it:
+>
+> 1. **No portal.** `org.freedesktop.portal.RemoteDesktop` is not
+>    implemented by `xdg-desktop-portal-hyprland`
+>    ([upstream #252](https://github.com/hyprwm/xdg-desktop-portal-hyprland/issues/252),
+>    open since Aug 2024). Confirmed locally: `busctl` reports "No such
+>    interface"; `strings` on xdph 1.3.12 finds zero RemoteDesktop/EIS
+>    symbols. No repo upgrade provides it.
+> 2. **It wouldn't help anyway.** The only community RemoteDesktop impl
+>    (`xdg-desktop-portal-hypr-remote`) bridges EIS back down to
+>    `zwp_virtual_keyboard_v1` — the *same* protocol wtype uses, which
+>    Hyprland filters out of its bind matcher. So libei-via-portal would
+>    **not** make `super+T` trigger binds, the entire reason for the
+>    migration.
+>
+> **What we did instead (v0.8):** route `press_keys` through **ydotool**
+> (uinput→libinput), which Hyprland's bind matcher *does* honor — verified
+> live: synthesized `super+T` fires the `bind`. `type_text` stays on wtype.
+> See [[libei-dead-use-ydotool]] memory and the input crate's `keys.rs` /
+> `runner.rs`.
+>
+> **Revisit this doc only if** xdph ships a real libinput-backed
+> RemoteDesktop (not a virtual-keyboard bridge). The premise below assumes
+> that; it does not hold today.
+
+---
+
+Original design (v0.7 scaffold → intended v0.8 implementation):
 
 ## Why libei
 

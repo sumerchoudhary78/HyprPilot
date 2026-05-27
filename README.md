@@ -144,8 +144,24 @@ empty rather than aborting.
 ### Input synthesis (v0.5)
 
 Type text, press key chords, move and click the mouse. Built on
-external tools (`wtype` for keyboard, `ydotool` for mouse) plus
-Hyprland's native `sendshortcut` for per-window key delivery.
+external tools plus Hyprland's native `sendshortcut` for per-window
+key delivery.
+
+Backend routing per operation:
+
+| Operation | Backend | Why |
+|---|---|---|
+| `input type` | `wtype` (virtual-keyboard) | Fast batched text into the focused window; bind-triggering is irrelevant for plain text. |
+| `input keys` | `ydotool` (uinput→libinput), falls back to `wtype` | **ydotool events reach Hyprland's global bind matcher, so `super+T` fires its `bind`.** wtype's virtual-keyboard events are filtered out of the bind matcher (focused client only). |
+| `input mouse-move` / `mouse-click` | `ydotool` | Pointer synthesis. |
+| `input shortcut` | Hyprland `sendshortcut` | Per-window, no focus change, no external backend. |
+
+> **`input keys` needs `ydotoold` running** to trigger binds. hyprpilot
+> looks for its socket at `$YDOTOOL_SOCKET`, then
+> `$XDG_RUNTIME_DIR/.ydotool_socket`, then `/tmp/.ydotool_socket`. If
+> ydotoold is unreachable, `input keys` degrades to wtype — chords still
+> reach the focused window but **won't** trigger compositor binds. Run
+> ydotoold as a `systemd --user` service so it's always available.
 
 **This is the most dangerous tool surface in HyprPilot.** An agent
 that can type can execute arbitrary shell commands in any focused
@@ -294,6 +310,13 @@ Both backends are graceful about misuse:
   - **OCR**: `tesseract`-backed text extraction.
   - **MCP `Content::Image`** with base64 PNG/JPEG plus 5 new tools
     in `ToolGroup::Vision` (opt-in only).
-- v0.7: libei migration (replaces wtype/ydotool with Wayland-native EI);
-  composite tools (`click_text`, `find_text_position`); rich preview
-  for snapshot-restore that embeds the diff actions.
+- v0.7: composite tools (`click_text`, `find_text_position`); rich
+  preview for snapshot-restore that embeds the diff actions; libei
+  backend scaffold (feature-flagged stub).
+- v0.8: `input keys` routed through ydotool (uinput→libinput) so
+  Hyprland global binds fire — `super+T` now triggers its `bind`.
+  XDG-aware ydotoold socket discovery. The libei migration was
+  **shelved** (`docs/libei-design.md`): Hyprland has no RemoteDesktop
+  portal, and the only community bridge falls back to virtual-keyboard,
+  which Hyprland filters from its bind matcher — so libei would not
+  have achieved the goal. ydotool already does.

@@ -20,7 +20,8 @@ pub struct BackendAvailability {
     pub ydotoold_socket: PathBuf,
 }
 
-/// Default location ydotool checks when `$YDOTOOL_SOCKET` is unset.
+/// Legacy ydotoold socket location, used only when neither
+/// `$YDOTOOL_SOCKET` nor `$XDG_RUNTIME_DIR` resolves a socket.
 pub const DEFAULT_YDOTOOLD_SOCKET: &str = "/tmp/.ydotool_socket";
 
 impl BackendAvailability {
@@ -50,12 +51,26 @@ impl BackendAvailability {
     }
 }
 
-/// Resolve ydotoold's socket path: `$YDOTOOL_SOCKET` if set, else the
-/// upstream default.
+/// Resolve ydotoold's socket path. Resolution order, matching how modern
+/// ydotoold picks its socket:
+///
+/// 1. `$YDOTOOL_SOCKET` — explicit override, always wins.
+/// 2. `$XDG_RUNTIME_DIR/.ydotool_socket` — where ydotoold's `systemd
+///    --user` unit and recent versions put it (e.g.
+///    `/run/user/1000/.ydotool_socket`).
+/// 3. [`DEFAULT_YDOTOOLD_SOCKET`] (`/tmp/.ydotool_socket`) — legacy
+///    fallback for older ydotoold.
+///
+/// Existence is checked separately ([`BackendAvailability::ydotoold_reachable`]);
+/// this only decides *where* to look.
 pub fn ydotoold_socket_path() -> PathBuf {
-    std::env::var_os("YDOTOOL_SOCKET")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_YDOTOOLD_SOCKET))
+    if let Some(explicit) = std::env::var_os("YDOTOOL_SOCKET") {
+        return PathBuf::from(explicit);
+    }
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return PathBuf::from(runtime).join(".ydotool_socket");
+    }
+    PathBuf::from(DEFAULT_YDOTOOLD_SOCKET)
 }
 
 /// `which`-style lookup. Walks `$PATH`, returns the first executable
