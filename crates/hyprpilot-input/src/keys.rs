@@ -61,6 +61,83 @@ impl Modifier {
             Modifier::Super => "SUPER",
         }
     }
+
+    /// Linux input-event-code for the left variant of this modifier, used
+    /// by the ydotool backend. From `<linux/input-event-codes.h>`:
+    /// `KEY_LEFTCTRL=29`, `KEY_LEFTSHIFT=42`, `KEY_LEFTALT=56`,
+    /// `KEY_LEFTMETA=125`.
+    pub fn ydotool_keycode(self) -> u16 {
+        match self {
+            Modifier::Ctrl => 29,
+            Modifier::Shift => 42,
+            Modifier::Alt => 56,
+            Modifier::Super => 125,
+        }
+    }
+}
+
+/// Map an xkb keysym name (as accepted by wtype's `-k`) to its Linux
+/// input-event-code for the ydotool backend. Returns `None` for keysyms
+/// we don't have a code for — callers fall back to the wtype (keysym-name)
+/// path in that case.
+///
+/// Single ASCII letters are case-insensitive (`t` and `T` both → `KEY_T`);
+/// the actual upper/lower distinction is the Shift modifier's job, same as
+/// a real keyboard. Codes are from `<linux/input-event-codes.h>`.
+pub fn keysym_to_evdev(key: &str) -> Option<u16> {
+    // Single ASCII letter → KEY_A..KEY_Z (evdev's qwerty layout order).
+    if key.len() == 1 {
+        let c = key.as_bytes()[0].to_ascii_lowercase();
+        if c.is_ascii_lowercase() {
+            return Some(match c {
+                b'a' => 30, b'b' => 48, b'c' => 46, b'd' => 32, b'e' => 18,
+                b'f' => 33, b'g' => 34, b'h' => 35, b'i' => 23, b'j' => 36,
+                b'k' => 37, b'l' => 38, b'm' => 50, b'n' => 49, b'o' => 24,
+                b'p' => 25, b'q' => 16, b'r' => 19, b's' => 31, b't' => 20,
+                b'u' => 22, b'v' => 47, b'w' => 17, b'x' => 45, b'y' => 21,
+                b'z' => 44,
+                _ => unreachable!("guarded by is_ascii_lowercase"),
+            });
+        }
+        if c.is_ascii_digit() {
+            // KEY_1..KEY_9 = 2..10, KEY_0 = 11.
+            return Some(if c == b'0' { 11 } else { (c - b'1') as u16 + 2 });
+        }
+    }
+    // Named keys. Accept the wtype/xkb spelling plus common aliases,
+    // case-insensitively.
+    Some(match key.to_ascii_lowercase().as_str() {
+        "return" | "enter" | "kp_enter" => 28,
+        "space" => 57,
+        "tab" => 15,
+        "escape" | "esc" => 1,
+        "backspace" => 14,
+        "delete" | "del" => 111,
+        "insert" | "ins" => 110,
+        "home" => 102,
+        "end" => 107,
+        "page_up" | "pageup" | "prior" => 104,
+        "page_down" | "pagedown" | "next" => 109,
+        "up" => 103,
+        "down" => 108,
+        "left" => 105,
+        "right" => 106,
+        "minus" => 12,
+        "equal" => 13,
+        "comma" => 51,
+        "period" | "dot" => 52,
+        "slash" => 53,
+        "semicolon" => 39,
+        "apostrophe" => 40,
+        "grave" => 41,
+        "bracketleft" => 26,
+        "bracketright" => 27,
+        "backslash" => 43,
+        "f1" => 59, "f2" => 60, "f3" => 61, "f4" => 62, "f5" => 63,
+        "f6" => 64, "f7" => 65, "f8" => 66, "f9" => 67, "f10" => 68,
+        "f11" => 87, "f12" => 88,
+        _ => return None,
+    })
 }
 
 /// An ordered set of modifiers. `BTreeSet` gives deterministic encoding.
@@ -144,6 +221,41 @@ impl KeyCombo {
     pub fn encode_hyprctl_mods(&self) -> String {
         let names: Vec<&str> = self.modifiers.iter().map(|m| m.hyprctl_name()).collect();
         names.join(" ")
+    }
+
+    /// Encode for `ydotool key`: a sequence of `<keycode>:<state>` tokens
+    /// where state `1` is press and `0` is release. Modifiers are pressed
+    /// first (BTreeSet order) then released in reverse, bracketing the key:
+    ///
+    /// ```text
+    /// ctrl+shift+t  ->  29:1 42:1 20:1 20:0 42:0 29:0
+    /// ```
+    ///
+    /// Unlike [`Self::encode_wtype`], events go through uinput→libinput, so
+    /// Hyprland's global bind matcher sees the chord (e.g. `super+T` fires a
+    /// `bind`). wtype's virtual-keyboard events are filtered out of the bind
+    /// matcher and only reach the focused client.
+    ///
+    /// Returns [`InputError::InvalidCombo`] if the key has no known
+    /// input-event-code; the runner falls back to the wtype path then.
+    pub fn encode_ydotool_key(&self) -> Result<Vec<String>> {
+        let key_code = keysym_to_evdev(&self.key).ok_or_else(|| {
+            InputError::InvalidCombo(format!(
+                "key `{}` has no known Linux input-event code for the ydotool backend",
+                self.key
+            ))
+        })?;
+        let mods: Vec<u16> = self.modifiers.iter().map(|m| m.ydotool_keycode()).collect();
+        let mut argv = Vec::with_capacity(mods.len() * 2 + 2);
+        for m in &mods {
+            argv.push(format!("{m}:1"));
+        }
+        argv.push(format!("{key_code}:1"));
+        argv.push(format!("{key_code}:0"));
+        for m in mods.iter().rev() {
+            argv.push(format!("{m}:0"));
+        }
+        Ok(argv)
     }
 }
 
@@ -286,6 +398,59 @@ mod tests {
                 .map(String::from)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn encodes_ydotool_brackets_modifiers_around_key() {
+        // ctrl+shift+t: mods down in BTreeSet order, key down/up, mods up reversed.
+        let c = KeyCombo::parse("ctrl+shift+t").unwrap();
+        assert_eq!(
+            c.encode_ydotool_key().unwrap(),
+            vec!["29:1", "42:1", "20:1", "20:0", "42:0", "29:0"]
+        );
+    }
+
+    #[test]
+    fn encodes_ydotool_super_t() {
+        // The headline case: super+T must produce KEY_LEFTMETA(125) + KEY_T(20).
+        let c = KeyCombo::parse("super+t").unwrap();
+        assert_eq!(c.encode_ydotool_key().unwrap(), vec!["125:1", "20:1", "20:0", "125:0"]);
+    }
+
+    #[test]
+    fn encodes_ydotool_lone_key() {
+        let c = KeyCombo::parse("Return").unwrap();
+        assert_eq!(c.encode_ydotool_key().unwrap(), vec!["28:1", "28:0"]);
+    }
+
+    #[test]
+    fn ydotool_key_is_case_insensitive_for_letters() {
+        assert_eq!(keysym_to_evdev("t"), keysym_to_evdev("T"));
+        assert_eq!(keysym_to_evdev("t"), Some(20));
+    }
+
+    #[test]
+    fn ydotool_digits_and_named_keys() {
+        assert_eq!(keysym_to_evdev("1"), Some(2));
+        assert_eq!(keysym_to_evdev("0"), Some(11));
+        assert_eq!(keysym_to_evdev("space"), Some(57));
+        assert_eq!(keysym_to_evdev("Escape"), Some(1));
+        assert_eq!(keysym_to_evdev("esc"), Some(1));
+        assert_eq!(keysym_to_evdev("F12"), Some(88));
+        assert_eq!(keysym_to_evdev("Page_Up"), Some(104));
+    }
+
+    #[test]
+    fn ydotool_unknown_keysym_is_none() {
+        // Falls back to wtype in the runner.
+        assert_eq!(keysym_to_evdev("Hyper_L"), None);
+        assert_eq!(keysym_to_evdev("XF86AudioPlay"), None);
+    }
+
+    #[test]
+    fn encode_ydotool_errors_on_unmappable_key() {
+        let c = KeyCombo::parse("ctrl+XF86AudioMute").unwrap();
+        assert!(matches!(c.encode_ydotool_key(), Err(InputError::InvalidCombo(_))));
     }
 
     #[test]

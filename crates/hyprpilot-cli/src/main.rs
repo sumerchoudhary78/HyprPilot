@@ -223,7 +223,9 @@ enum InputCmd {
         #[arg(trailing_var_arg = true, required = true)]
         text: Vec<String>,
     },
-    /// Press a key chord in the focused window (via wtype).
+    /// Press a key chord. Routed through ydotool (uinput→libinput) when
+    /// available so Hyprland global binds fire (e.g. `super+T`); falls back
+    /// to wtype (focused window only, no binds) if ydotoold is unreachable.
     Keys {
         /// e.g. `ctrl+shift+t`, `super+space`, `Escape`.
         combo: String,
