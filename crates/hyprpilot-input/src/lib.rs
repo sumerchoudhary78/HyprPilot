@@ -44,8 +44,10 @@ pub mod keys;
 #[cfg(feature = "libei")]
 pub mod libei;
 pub mod runner;
+pub mod virtual_pointer;
 
 pub use detect::BackendAvailability;
 pub use error::InputError;
 pub use keys::{KeyCombo, Modifier, ModifierSet, MouseButton};
 pub use runner::InputRunner;
+pub use virtual_pointer::VirtualPointer;

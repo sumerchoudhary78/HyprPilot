@@ -5,13 +5,19 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Input synthesis (typing, key chords, mouse) for HyprPilot via wtype / ydotool shell-out"
+description = "Input synthesis (typing, key chords, mouse) for HyprPilot via wtype / ydotool shell-out + wlr-virtual-pointer for mouse"
 
 [dependencies]
 tokio = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Native Wayland client for the wlr-virtual-pointer-v1 transport.
+# Replaces ydotool for all mouse motion/clicks: events go straight into
+# the compositor's input pipeline, bypassing libinput pointer-accel on
+# the synthetic device (the root cause of issue #25's 2x drift).
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 # libei backend (v0.7 scaffold — not yet wired up). `reis` is the only
 # pure-Rust libei/EIS implementation on crates.io.
 reis = { version = "0.6", optional = true, features = ["tokio"] }

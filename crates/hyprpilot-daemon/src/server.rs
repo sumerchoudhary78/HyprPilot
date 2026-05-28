@@ -98,6 +98,7 @@ pub async fn run(socket_path: PathBuf) -> AnyResult<()> {
     if input_enabled {
         info!(
             backend = input_runner.backend_name(),
+            mouse = input_runner.mouse_backend_name(),
             wtype = ?input_runner.backends().wtype,
             ydotool = ?input_runner.backends().ydotool,
             "input synthesis ENABLED (HYPRPILOT_DANGEROUS_INPUT_OK=1)"
@@ -347,6 +348,7 @@ fn input_error_response(e: InputError) -> Response {
         InputError::NotImplemented { .. } => codes::INPUT_BACKEND_MISSING,
         InputError::InvalidBackendSelection(_) => codes::INPUT_BACKEND_MISSING,
         InputError::Io(_) => codes::INPUT_FAILED,
+        InputError::VirtualPointer(_) => codes::INPUT_FAILED,
     };
     Response::err(code, e.to_string())
 }
