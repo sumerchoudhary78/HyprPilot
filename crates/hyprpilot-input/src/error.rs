@@ -36,6 +36,9 @@ pub enum InputError {
 
     #[error("I/O error invoking input backend: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("wlr-virtual-pointer transport failed: {0}")]
+    VirtualPointer(String),
 }
 
 pub type Result<T> = std::result::Result<T, InputError>;

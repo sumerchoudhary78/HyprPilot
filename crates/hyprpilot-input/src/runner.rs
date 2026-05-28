@@ -21,6 +21,7 @@ use tracing::debug;
 use crate::detect::BackendAvailability;
 use crate::error::{InputError, Result};
 use crate::keys::{KeyCombo, MouseButton};
+use crate::virtual_pointer::VirtualPointer;
 
 /// Env var selecting the input backend at daemon startup.
 ///
@@ -48,17 +49,30 @@ impl BackendImpl {
 pub struct InputRunner {
     pub(crate) backends: BackendAvailability,
     backend: BackendImpl,
+    /// Native wlr-virtual-pointer transport for mouse motion/clicks.
+    /// `None` when the compositor doesn't advertise the protocol or no
+    /// Wayland display is reachable; mouse falls back to ydotool in that
+    /// case. Constructed only by [`Self::detect`] / [`Self::detect_with`]
+    /// — `with_backends` stays VP-free so unit tests don't need a live
+    /// Wayland server.
+    virtual_pointer: Option<VirtualPointer>,
 }
 
 impl InputRunner {
     /// Construct with explicit detection results. Selects the wtype path
-    /// unconditionally — used by tests and any caller that wants to
-    /// bypass the env-var selector.
+    /// unconditionally and does *not* attempt a Wayland connection —
+    /// used by tests and any caller that wants to bypass the env-var
+    /// selector. Production code paths go through [`Self::detect`] so
+    /// the virtual-pointer transport is initialised.
     pub fn with_backends(backends: BackendAvailability) -> Self {
         let backend = BackendImpl::WtypeYdotool(WtypeYdotoolBackend {
             backends: backends.clone(),
         });
-        Self { backends, backend }
+        Self {
+            backends,
+            backend,
+            virtual_pointer: None,
+        }
     }
 
     /// Probe `$PATH` and pick a backend.
@@ -67,6 +81,9 @@ impl InputRunner {
     /// `libei` (gated on cargo feature + env var). On any selection
     /// error it logs and falls back to the wtype path — the daemon
     /// should remain runnable.
+    ///
+    /// Also attempts to attach a [`VirtualPointer`] for mouse — silent
+    /// fallback to ydotool if the compositor doesn't support it.
     pub fn detect() -> Self {
         let backends = BackendAvailability::detect();
         Self::detect_with(backends).unwrap_or_else(|err| {
@@ -74,7 +91,7 @@ impl InputRunner {
                 error = %err,
                 "falling back to wtype backend after selection failure"
             );
-            Self::with_backends(BackendAvailability::detect())
+            Self::with_backends(BackendAvailability::detect()).attach_virtual_pointer()
         })
     }
 
@@ -82,11 +99,29 @@ impl InputRunner {
     /// callers (and tests) can assert on them.
     pub fn detect_with(backends: BackendAvailability) -> Result<Self> {
         let selection = std::env::var(BACKEND_ENV).ok();
-        match selection.as_deref() {
-            None | Some("") | Some("wtype") => Ok(Self::with_backends(backends)),
-            Some("libei") => Self::new_libei(backends),
-            Some(other) => Err(InputError::InvalidBackendSelection(other.to_string())),
+        let runner = match selection.as_deref() {
+            None | Some("") | Some("wtype") => Self::with_backends(backends),
+            Some("libei") => Self::new_libei(backends)?,
+            Some(other) => return Err(InputError::InvalidBackendSelection(other.to_string())),
+        };
+        Ok(runner.attach_virtual_pointer())
+    }
+
+    /// Try to bring up the wlr-virtual-pointer transport for mouse. On
+    /// failure the runner keeps `virtual_pointer == None` and mouse calls
+    /// transparently fall back to ydotool. Idempotent: safe to call again
+    /// (replaces any existing handle).
+    fn attach_virtual_pointer(mut self) -> Self {
+        match VirtualPointer::try_new() {
+            Some(vp) => {
+                tracing::info!("mouse transport: wlr-virtual-pointer-v1 (native Wayland)");
+                self.virtual_pointer = Some(vp);
+            }
+            None => {
+                tracing::info!("mouse transport: ydotool (wlr-virtual-pointer unavailable)");
+            }
         }
+        self
     }
 
     #[cfg(feature = "libei")]
@@ -109,10 +144,24 @@ impl InputRunner {
         &self.backends
     }
 
-    /// Name of the active backend — `"wtype"` or `"libei"`. Useful for
-    /// startup logging and diagnostics.
+    /// Name of the active typing/keyboard backend — `"wtype"` or
+    /// `"libei"`. Mouse uses its own transport — see
+    /// [`Self::mouse_backend_name`].
     pub fn backend_name(&self) -> &'static str {
         self.backend.name()
+    }
+
+    /// Which transport mouse motion/clicks go through. Reflects the
+    /// runtime state of [`VirtualPointer`] attachment, not a compile-time
+    /// feature: a daemon started against a compositor that doesn't
+    /// advertise wlr-virtual-pointer-v1 reports `"ydotool"` even though
+    /// the code path was built in.
+    pub fn mouse_backend_name(&self) -> &'static str {
+        if self.virtual_pointer.is_some() {
+            "wlr-virtual-pointer"
+        } else {
+            "ydotool"
+        }
     }
 
     pub async fn type_text(&self, text: &str) -> Result<()> {
@@ -137,7 +186,19 @@ impl InputRunner {
         }
     }
 
+    /// Move the pointer. Prefers the native wlr-virtual-pointer
+    /// transport — events go straight to the compositor, untouched by
+    /// libinput pointer-accel. Falls back to ydotool (uinput → libinput)
+    /// only when the protocol isn't available; that path still suffers
+    /// from issue #25's 2x drift on most Hyprland setups.
     pub async fn mouse_move(&self, x: i32, y: i32, absolute: bool) -> Result<()> {
+        if let Some(vp) = &self.virtual_pointer {
+            return if absolute {
+                vp.move_to(x, y).await
+            } else {
+                vp.move_by(x, y).await
+            };
+        }
         match &self.backend {
             BackendImpl::WtypeYdotool(b) => b.mouse_move(x, y, absolute).await,
             #[cfg(feature = "libei")]
@@ -148,7 +209,12 @@ impl InputRunner {
         }
     }
 
+    /// Click a mouse button. Same transport preference as
+    /// [`Self::mouse_move`].
     pub async fn mouse_click(&self, button: MouseButton) -> Result<()> {
+        if let Some(vp) = &self.virtual_pointer {
+            return vp.click(button).await;
+        }
         match &self.backend {
             BackendImpl::WtypeYdotool(b) => b.mouse_click(button).await,
             #[cfg(feature = "libei")]
