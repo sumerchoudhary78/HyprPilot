@@ -4,11 +4,25 @@ Programmatic control of Hyprland for AI agents and humans. Typed Rust IPC
 client, long-running daemon with undo and snapshots, CLI, MCP server, input
 synthesis, and screen capture + OCR.
 
-> Status: v0.6 in development. Adds screen capture (`grim`) and OCR
-> (`tesseract`) as a new `hyprpilot-vision` crate, with five new MCP tools
-> in a `Vision` capability group (excluded from the default profile because
-> screenshots can capture private content) and matching `hyprpilot capture`
-> / `hyprpilot ocr` CLI subcommands.
+> Status: **v1.0.0** — first stable release. Typed IPC client, daemon with
+> undo/snapshots, CLI, stdio MCP server, input synthesis (typing, key chords,
+> and mouse via `wlr-virtual-pointer-v1`), and screen capture (`grim`) + OCR
+> (`tesseract`) in a `Vision` capability group (excluded from the default
+> profile because screenshots can capture private content).
+
+## Install
+
+On Arch and Arch-based distros, install from the AUR:
+
+```sh
+yay -S hyprpilot      # or: paru -S hyprpilot
+```
+
+This installs the `hyprpilot`, `hyprpilot-daemon`, and `hyprpilot-mcp`
+binaries. The Vision and input backends (`grim`, `slurp`, `tesseract`,
+`wtype`, `ydotool`) are optional dependencies — install the ones you need.
+
+To build from source, see [Quick start](#quick-start-cli) below.
 
 ## Crates
 

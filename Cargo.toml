@@ -10,17 +10,17 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/Luffy/HyprPilot"
+repository = "https://github.com/sumerchoudhary78/HyprPilot"
 rust-version = "1.75"
 
 [workspace.dependencies]
-hyprpilot-core = { path = "crates/hyprpilot-core", version = "0.1.0" }
-hyprpilot-daemon = { path = "crates/hyprpilot-daemon", version = "0.1.0" }
-hyprpilot-input = { path = "crates/hyprpilot-input", version = "0.1.0" }
-hyprpilot-vision = { path = "crates/hyprpilot-vision", version = "0.1.0" }
+hyprpilot-core = { path = "crates/hyprpilot-core", version = "1.0.0" }
+hyprpilot-daemon = { path = "crates/hyprpilot-daemon", version = "1.0.0" }
+hyprpilot-input = { path = "crates/hyprpilot-input", version = "1.0.0" }
+hyprpilot-vision = { path = "crates/hyprpilot-vision", version = "1.0.0" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "fs", "sync", "signal", "time", "process"] }
 serde = { version = "1", features = ["derive"] }
