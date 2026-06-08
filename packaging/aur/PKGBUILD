@@ -1,5 +1,5 @@
 # Maintainer: Sumer Jakhar <sumer.jakhar@emoha.com>
-pkgname=hyprpilot
+pkgname=hyprpilot-mcp
 pkgver=1.0.0
 pkgrel=1
 pkgdesc="Programmatic control of Hyprland for AI agents and humans: typed IPC client, daemon with undo/snapshots, CLI, MCP server, input synthesis, and screen capture + OCR"
@@ -15,7 +15,7 @@ optdepends=('grim: screen capture for the Vision tools'
             'wtype: text and key-chord input synthesis'
             'ydotool: input-synthesis fallback that drives Hyprland keybinds')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('1b308d0fb6d2ada3dc3de96df99c8a613ee2a75fe18921ef1e79b116b9eb307e')
 
 prepare() {
     cd "HyprPilot-$pkgver"

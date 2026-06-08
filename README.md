@@ -15,7 +15,7 @@ synthesis, and screen capture + OCR.
 On Arch and Arch-based distros, install from the AUR:
 
 ```sh
-yay -S hyprpilot      # or: paru -S hyprpilot
+yay -S hyprpilot-mcp      # or: paru -S hyprpilot-mcp
 ```
 
 This installs the `hyprpilot`, `hyprpilot-daemon`, and `hyprpilot-mcp`
