@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 
 use hyprpilot_core::dispatch::FullscreenMode;
 use hyprpilot_core::selector::{WindowSelector, WorkspaceRef};
-use hyprpilot_core::types::Client as HyprClient;
+use hyprpilot_core::types::{Client as HyprClient, Monitor};
 use hyprpilot_core::{Connection, Error as CoreError};
 use hyprpilot_a11y::{A11y, A11yError, WalkOpts};
 use hyprpilot_input::keys::{KeyCombo, MouseButton};
@@ -441,13 +441,58 @@ async fn input_mouse_move(state: &State, x: i32, y: i32, absolute: bool) -> Resp
     if !state.input_enabled {
         return input_disabled_response();
     }
-    match state.input_runner.mouse_move(x, y, absolute).await {
+    // The wlr-virtual-pointer maps absolute coordinates against each output's
+    // DEVICE resolution (its `wl_output` mode), but the rest of HyprPilot —
+    // hyprctl geometry, a11y extents, OCR-derived points — is in LOGICAL
+    // compositor coordinates. On a scaled output those differ by the monitor
+    // scale, so a logical point would land at `logical/scale` (e.g. half, at
+    // scale 2). Convert logical → device here so callers always speak logical.
+    let (mx, my) = if absolute {
+        logical_to_device(state, x, y).await
+    } else {
+        (x, y)
+    };
+    match state.input_runner.mouse_move(mx, my, absolute).await {
+        // Report the logical point the caller asked for, not the device one.
         Ok(()) => Response::ok(serde_json::json!({
             "moved_to": [x, y],
             "absolute": absolute,
         })),
         Err(e) => input_error_response(e),
     }
+}
+
+/// Convert a LOGICAL compositor coordinate to the DEVICE-pixel coordinate the
+/// virtual pointer expects, using the scale of the monitor containing the
+/// point. Exact for a single output (or uniform-scale setups); for mixed-scale
+/// multi-monitor layouts it uses the containing monitor's scale, which is a
+/// best-effort approximation of the virtual pointer's union coordinate space.
+async fn logical_to_device(state: &State, x: i32, y: i32) -> (i32, i32) {
+    let scale = match state.cache.monitors().await {
+        Ok(monitors) => scale_at(&monitors, x, y),
+        Err(_) => 1.0,
+    };
+    (
+        ((x as f64) * scale).round() as i32,
+        ((y as f64) * scale).round() as i32,
+    )
+}
+
+/// Scale of the monitor whose LOGICAL bounds contain `(x, y)`, falling back to
+/// the focused monitor, then the first, then 1.0. A monitor's logical size is
+/// its device mode divided by its scale.
+fn scale_at(monitors: &[Monitor], x: i32, y: i32) -> f64 {
+    monitors
+        .iter()
+        .find(|m| {
+            let lw = (m.width as f64 / m.scale).round() as i32;
+            let lh = (m.height as f64 / m.scale).round() as i32;
+            x >= m.x && x < m.x + lw && y >= m.y && y < m.y + lh
+        })
+        .or_else(|| monitors.iter().find(|m| m.focused))
+        .or_else(|| monitors.first())
+        .map(|m| m.scale)
+        .unwrap_or(1.0)
 }
 
 async fn input_mouse_click(state: &State, button: MouseButton) -> Response {
@@ -927,3 +972,55 @@ fn core_error(e: CoreError) -> Response {
 
 #[allow(dead_code)]
 pub(crate) fn _socket_path_dummy(_: &Path) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn monitor(x: i32, y: i32, w: i32, h: i32, scale: f64, focused: bool) -> Monitor {
+        serde_json::from_value(serde_json::json!({
+            "id": 0, "name": "eDP-1", "width": w, "height": h,
+            "x": x, "y": y, "scale": scale, "transform": 0,
+            "focused": focused, "disabled": false,
+        }))
+        .expect("valid monitor fixture")
+    }
+
+    #[test]
+    fn scale_at_single_monitor_returns_its_scale() {
+        // 1920x1080 @2.0 → logical 960x540; a point inside maps at scale 2.0.
+        let mons = vec![monitor(0, 0, 1920, 1080, 2.0, true)];
+        assert_eq!(scale_at(&mons, 246, 483), 2.0);
+    }
+
+    #[test]
+    fn scale_at_handles_fractional() {
+        let mons = vec![monitor(0, 0, 1920, 1080, 1.5, true)];
+        assert_eq!(scale_at(&mons, 100, 100), 1.5);
+    }
+
+    #[test]
+    fn scale_at_picks_the_containing_monitor() {
+        // m0: logical x 0..960 @2.0 ; m1: logical x 960..2240 @1.0.
+        let mons = vec![
+            monitor(0, 0, 1920, 1080, 2.0, true),
+            monitor(960, 0, 1280, 720, 1.0, false),
+        ];
+        assert_eq!(scale_at(&mons, 100, 100), 2.0, "point in m0");
+        assert_eq!(scale_at(&mons, 1500, 100), 1.0, "point in m1");
+    }
+
+    #[test]
+    fn scale_at_outside_all_falls_back_to_focused() {
+        let mons = vec![
+            monitor(0, 0, 1920, 1080, 2.0, false),
+            monitor(960, 0, 1280, 720, 1.5, true),
+        ];
+        assert_eq!(scale_at(&mons, 5000, 5000), 1.5, "no containing monitor → focused");
+    }
+
+    #[test]
+    fn scale_at_empty_is_identity() {
+        assert_eq!(scale_at(&[], 100, 100), 1.0);
+    }
+}
