@@ -1,0 +1,18 @@
+[package]
+name = "hyprpilot-a11y"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Not workspace-inherited: modern `atspi` needs a newer toolchain than the
+# 1.75 floor the rest of the workspace declares. This crate is an optional
+# capability layer, so it carries its own (higher) MSRV.
+rust-version = "1.81"
+description = "Accessibility (AT-SPI2) tree reading for HyprPilot — structured UI without OCR"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+atspi = { version = "0.30", default-features = false, features = ["proxies", "connection", "tokio"] }

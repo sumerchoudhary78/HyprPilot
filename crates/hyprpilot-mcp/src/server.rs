@@ -16,8 +16,9 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, warn};
 
+use hyprpilot_a11y::Element;
 use hyprpilot_core::snapshot::SnapshotRestorePreview;
-use hyprpilot_core::types::Monitor;
+use hyprpilot_core::types::{Client, Monitor};
 use hyprpilot_daemon::client::{ClientError, DaemonClient};
 use hyprpilot_daemon::protocol::Request;
 use hyprpilot_vision::{
@@ -31,7 +32,9 @@ use crate::protocol::{
     JsonRpcRequest, JsonRpcResponse, ListToolsResult, ServerCapabilities, ServerInfo, Tool,
     PROTOCOL_VERSION,
 };
-use crate::tools::{self, CaptureOp, ClickTextOp, Dispatch, DispatchError, FindTextOp, OcrOp, ToolDef};
+use crate::tools::{
+    self, A11yClickOp, CaptureOp, ClickTextOp, Dispatch, DispatchError, FindTextOp, OcrOp, ToolDef,
+};
 
 pub struct Server {
     profile: Profile,
@@ -218,6 +221,7 @@ impl Server {
             Dispatch::Ocr(op) => handle_ocr(id, op).await,
             Dispatch::FindText(op) => handle_find_text(id, op).await,
             Dispatch::ClickText(op) => self.handle_click_text(id, op).await,
+            Dispatch::A11yClick(op) => self.handle_a11y_click(id, op).await,
         }
     }
 
@@ -316,6 +320,134 @@ impl Server {
         }
 
         let body = render_click_applied(chosen, total, cx, cy);
+        JsonRpcResponse::ok(
+            id,
+            CallToolResult { content: vec![Content::text(body)], is_error: false },
+        )
+    }
+
+    /// `a11y_click`: find an element by label/role via the daemon, turn its
+    /// window-relative box into a screen point using the window's geometry,
+    /// then (unless dry-run) move + click.
+    ///
+    /// Coordinate model: AT-SPI window-relative extents and Hyprland's window
+    /// `at` are both treated as logical compositor pixels, so the click point
+    /// is simply `window.at + element.center`. The dry-run preview surfaces
+    /// every input (window origin, element box, result) so a wrong assumption
+    /// is visible before anything moves.
+    async fn handle_a11y_click(&mut self, id: Value, op: A11yClickOp) -> JsonRpcResponse {
+        // Stage 1: find candidates via the daemon's a11y walk.
+        let find = Request::A11yFind {
+            pid: op.pid,
+            query: op.query.clone(),
+            role: op.role.clone(),
+            max_nodes: op.max_nodes,
+        };
+        let value = match self.call_daemon(find).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.daemon = None;
+                let (code, message) = classify_daemon_error(&e);
+                return tool_error(id, code, message);
+            }
+        };
+        let resolved_pid = value.get("pid").and_then(Value::as_i64).map(|n| n as i32);
+        let elements: Vec<Element> = match value.get("elements").cloned() {
+            Some(v) => match serde_json::from_value(v) {
+                Ok(els) => els,
+                Err(e) => {
+                    return tool_error(
+                        id,
+                        ErrorCode::ToolExecution,
+                        format!("daemon returned malformed a11y elements: {e}"),
+                    );
+                }
+            },
+            None => Vec::new(),
+        };
+
+        // Only positive-area elements are clickable targets.
+        let matches: Vec<Element> = elements.into_iter().filter(Element::is_clickable).collect();
+        if matches.is_empty() {
+            return tool_error(
+                id,
+                ErrorCode::ToolExecution,
+                format!("no clickable accessibility element matched `{}`", op.query),
+            );
+        }
+        let total = matches.len();
+        if op.require_unique && total > 1 && op.match_index == 0 {
+            return tool_error(id, ErrorCode::ToolExecution, render_a11y_ambiguity(&op.query, &matches));
+        }
+        if op.match_index >= total {
+            return tool_error(
+                id,
+                ErrorCode::InvalidParams,
+                format!(
+                    "match_index {} out of bounds: only {} clickable match(es) for `{}`",
+                    op.match_index, total, op.query
+                ),
+            );
+        }
+        let chosen = matches[op.match_index].clone();
+
+        // Stage 2: anchor the window-relative box to the window's screen origin.
+        let Some(pid) = resolved_pid else {
+            return tool_error(
+                id,
+                ErrorCode::ToolExecution,
+                "daemon did not report a resolved pid to anchor the click".to_string(),
+            );
+        };
+        let clients = match self.call_daemon(Request::QueryClients).await {
+            Ok(v) => match serde_json::from_value::<Vec<Client>>(v) {
+                Ok(c) => c,
+                Err(e) => {
+                    return tool_error(
+                        id,
+                        ErrorCode::ToolExecution,
+                        format!("daemon returned malformed clients: {e}"),
+                    );
+                }
+            },
+            Err(e) => {
+                self.daemon = None;
+                let (code, message) = classify_daemon_error(&e);
+                return tool_error(id, code, message);
+            }
+        };
+        let Some(window) = pick_window_for_pid(&clients, pid) else {
+            return tool_error(
+                id,
+                ErrorCode::ToolExecution,
+                format!("no window found for pid {pid} to anchor the click"),
+            );
+        };
+        let (ecx, ecy) = chosen.center();
+        let cx = window.at[0] + ecx;
+        let cy = window.at[1] + ecy;
+
+        if op.dry_run {
+            let body = render_a11y_click_preview(&op, &chosen, total, window, cx, cy);
+            return JsonRpcResponse::ok(
+                id,
+                CallToolResult { content: vec![Content::text(body)], is_error: false },
+            );
+        }
+
+        // Stage 3: drive input via the daemon (absolute move, then click).
+        if let Err(resp) = self
+            .run_input(id.clone(), Request::InputMouseMove { x: cx, y: cy, absolute: true })
+            .await
+        {
+            return resp;
+        }
+        if let Err(resp) =
+            self.run_input(id.clone(), Request::InputMouseClick { button: op.button }).await
+        {
+            return resp;
+        }
+        let body = render_a11y_click_applied(&chosen, total, cx, cy);
         JsonRpcResponse::ok(
             id,
             CallToolResult { content: vec![Content::text(body)], is_error: false },
@@ -565,6 +697,89 @@ fn render_ambiguity(query: &str, matches: &[TextMatch]) -> String {
         out.push_str(&format!("  ... and {} more\n", matches.len() - 8));
     }
     out
+}
+
+/// Pick the window to anchor an a11y click to: prefer the focused window
+/// (`focusHistoryID == 0`) among the pid's windows, else the first match.
+fn pick_window_for_pid(clients: &[Client], pid: i32) -> Option<&Client> {
+    let mut fallback = None;
+    for c in clients {
+        if c.pid == pid {
+            if c.focus_history_id == 0 {
+                return Some(c);
+            }
+            fallback.get_or_insert(c);
+        }
+    }
+    fallback
+}
+
+fn render_a11y_ambiguity(query: &str, matches: &[Element]) -> String {
+    let mut out = format!(
+        "ambiguous: `{}` matched {} clickable accessibility elements. Pass \
+         `match_index` (0..{}) to pick one, or `require_unique: false` to take \
+         the first:\n",
+        query,
+        matches.len(),
+        matches.len().saturating_sub(1),
+    );
+    for (i, m) in matches.iter().enumerate().take(8) {
+        out.push_str(&format!(
+            "  [{i}] {role} `{name}` (window-rel {x},{y} {w}x{h})\n",
+            role = m.role,
+            name = m.name,
+            x = m.x,
+            y = m.y,
+            w = m.w,
+            h = m.h,
+        ));
+    }
+    if matches.len() > 8 {
+        out.push_str(&format!("  ... and {} more\n", matches.len() - 8));
+    }
+    out
+}
+
+fn render_a11y_click_preview(
+    op: &A11yClickOp,
+    chosen: &Element,
+    total: usize,
+    window: &Client,
+    cx: i32,
+    cy: i32,
+) -> String {
+    let (ecx, ecy) = chosen.center();
+    format!(
+        "[dry_run] a11y_click would {button:?}-click {role} `{name}` at compositor ({cx}, {cy}).\n\
+         window `{class}` origin ({wx}, {wy}) + element window-relative centre ({ecx}, {ecy}); \
+         box {x},{y} {w}x{h}; match {idx}/{total}.\n\n\
+         Pass `dry_run: false` to apply.",
+        button = op.button,
+        role = chosen.role,
+        name = chosen.name,
+        class = window.class,
+        wx = window.at[0],
+        wy = window.at[1],
+        x = chosen.x,
+        y = chosen.y,
+        w = chosen.w,
+        h = chosen.h,
+        idx = op.match_index,
+        total = total,
+    )
+}
+
+fn render_a11y_click_applied(chosen: &Element, total: usize, cx: i32, cy: i32) -> String {
+    let body = serde_json::json!({
+        "clicked": {
+            "role": chosen.role,
+            "name": chosen.name,
+            "window_rel": { "x": chosen.x, "y": chosen.y, "w": chosen.w, "h": chosen.h },
+        },
+        "click_at": { "x": cx, "y": cy },
+        "total_matches": total,
+    });
+    serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string())
 }
 
 fn tool_error(id: Value, code: ErrorCode, message: String) -> JsonRpcResponse {

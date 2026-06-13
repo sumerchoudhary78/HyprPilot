@@ -85,6 +85,11 @@ pub enum Dispatch {
     /// (via the daemon's input RPCs). Both vision and input touch points
     /// live here so the server can handle them in one place.
     ClickText(ClickTextOp),
+    /// Composite: find an accessibility element by label/role (daemon
+    /// A11yFind), turn its window-relative box into a screen point using the
+    /// window's geometry, and optionally click it. The a11y analogue of
+    /// `ClickText`, without OCR.
+    A11yClick(A11yClickOp),
 }
 
 /// What to capture and how. Image format is resolved here so we don't pass
@@ -138,6 +143,20 @@ pub struct ClickTextOp {
     pub button: hyprpilot_input::keys::MouseButton,
     pub match_index: usize,
     pub require_unique: bool,
+    pub dry_run: bool,
+}
+
+/// What to click via accessibility. `pid=None` targets the focused window's
+/// app (resolved daemon-side from the world-model cache).
+#[derive(Debug)]
+pub struct A11yClickOp {
+    pub query: String,
+    pub role: Option<String>,
+    pub pid: Option<i32>,
+    pub button: hyprpilot_input::keys::MouseButton,
+    pub match_index: usize,
+    pub require_unique: bool,
+    pub max_nodes: Option<usize>,
     pub dry_run: bool,
 }
 
@@ -557,6 +576,65 @@ pub struct ClickTextArgs {
     pub require_unique: bool,
     /// When true (default), do not move/click. Return what WOULD be
     /// clicked plus the centre coordinates. Pass `false` to apply.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct A11yTreeArgs {
+    /// Process id of the app to introspect. When omitted, the focused
+    /// window's pid is used (resolved from the world-model cache).
+    #[serde(default)]
+    pub pid: Option<i32>,
+    /// Cap on nodes walked. Default 1500. Large apps (browsers) are
+    /// truncated; scope by app or use `a11y_find` instead.
+    #[serde(default)]
+    pub max_nodes: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct A11yFindArgs {
+    /// Substring to match against each element's accessible name or inline
+    /// text (case-insensitive). Empty matches on `role` alone.
+    #[serde(default)]
+    pub query: String,
+    /// Restrict to this AT-SPI role, e.g. `push button`, `entry`, `check box`,
+    /// `menu item`. Case-insensitive, exact role match.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Process id of the app to search. Omit to use the focused window.
+    #[serde(default)]
+    pub pid: Option<i32>,
+    /// Cap on nodes walked. Default 1500.
+    #[serde(default)]
+    pub max_nodes: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct A11yClickArgs {
+    /// Substring matched against the element's accessible name or inline text.
+    pub query: String,
+    /// Restrict to this AT-SPI role (e.g. `push button`). Case-insensitive.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Process id of the app. Omit to target the focused window's app.
+    #[serde(default)]
+    pub pid: Option<i32>,
+    /// `left` (default), `right`, `middle`, `x1`/`back`, `x2`/`forward`.
+    #[serde(default)]
+    pub button: Option<String>,
+    /// Which match to click when the query is ambiguous. Default 0.
+    #[serde(default)]
+    pub match_index: Option<usize>,
+    /// Fail loudly when more than one element matches and `match_index` was
+    /// not pinned. Default true.
+    #[serde(default = "default_true")]
+    pub require_unique: bool,
+    /// Cap on nodes walked. Default 1500.
+    #[serde(default)]
+    pub max_nodes: Option<usize>,
+    /// When true (default), do not move/click: return the matched element and
+    /// the computed screen coordinates. Pass `false` to apply.
     #[serde(default = "default_true")]
     pub dry_run: bool,
 }
@@ -1003,6 +1081,46 @@ pub fn registry() -> Vec<ToolDef> {
              (NOT in the default profile) and the daemon's \
              HYPRPILOT_DANGEROUS_INPUT_OK=1 gate.",
         ),
+        // ---- Accessibility (group: a11y) — NOT in default profile -----------
+        def::<A11yTreeArgs>(
+            "a11y_tree",
+            A11y,
+            false,
+            "Read the accessibility (AT-SPI) tree of an application as a flat \
+             list of elements: role, accessible name, inline text, and a \
+             window-relative bounding box for each. Structured UI content \
+             WITHOUT a screenshot or OCR — prefer this over `ocr_screen` for \
+             reading app content when the app exposes accessibility. `pid` \
+             defaults to the focused window. Coverage is toolkit-dependent \
+             (GTK/Qt/Firefox expose rich trees; terminals, games, and some \
+             Electron apps expose little) — fall back to vision when empty. \
+             Read-only. The `a11y` capability group is NOT in the default \
+             profile (a field's text may be sensitive).",
+        ),
+        def::<A11yFindArgs>(
+            "a11y_find",
+            A11y,
+            false,
+            "Find accessibility elements whose name or text matches `query` \
+             (and, optionally, whose role equals `role`, e.g. `push button`). \
+             Returns matches with window-relative bounding boxes. The \
+             structured, OCR-free analogue of `find_text_position`, and the \
+             first half of a click-by-label flow. `pid` defaults to the \
+             focused window. Read-only.",
+        ),
+        def::<A11yClickArgs>(
+            "a11y_click",
+            Input,
+            true,
+            "Find an accessibility element by label/role and click its centre. \
+             Composite of `a11y_find` + window geometry + `input_mouse_move` + \
+             `input_mouse_click` — no OCR, exact target box. dry_run defaults \
+             to true: returns the matched element and the computed screen \
+             coordinates (window origin + element box) without moving the \
+             cursor, so you can verify the target first. Requires the `input` \
+             capability group (NOT in the default profile) and the daemon's \
+             HYPRPILOT_DANGEROUS_INPUT_OK=1 gate.",
+        ),
     ]
 }
 
@@ -1329,6 +1447,50 @@ pub fn dispatch(name: &str, args: Value) -> Result<Dispatch, DispatchError> {
             }))
         }
 
+        // ---- accessibility -------------------------------------------------
+        "a11y_tree" => {
+            let p: A11yTreeArgs = parse_args(name, args)?;
+            Ok(Dispatch::Forward(Request::A11yTree {
+                pid: p.pid,
+                max_nodes: p.max_nodes,
+            }))
+        }
+        "a11y_find" => {
+            let p: A11yFindArgs = parse_args(name, args)?;
+            Ok(Dispatch::Forward(Request::A11yFind {
+                pid: p.pid,
+                query: p.query,
+                role: p.role,
+                max_nodes: p.max_nodes,
+            }))
+        }
+        "a11y_click" => {
+            let p: A11yClickArgs = parse_args(name, args)?;
+            if p.query.trim().is_empty() {
+                return Err(DispatchError::InvalidArgs {
+                    tool: name.to_string(),
+                    message: "query must not be empty".into(),
+                });
+            }
+            let button = match p.button.as_deref() {
+                None => MouseButton::Left,
+                Some(s) => MouseButton::parse(s).map_err(|e| DispatchError::InvalidArgs {
+                    tool: name.to_string(),
+                    message: e.to_string(),
+                })?,
+            };
+            Ok(Dispatch::A11yClick(A11yClickOp {
+                query: p.query,
+                role: p.role,
+                pid: p.pid,
+                button,
+                match_index: p.match_index.unwrap_or(0),
+                require_unique: p.require_unique,
+                max_nodes: p.max_nodes,
+                dry_run: p.dry_run,
+            }))
+        }
+
         other => Err(DispatchError::UnknownTool(other.to_string())),
     }
 }
@@ -1490,7 +1652,7 @@ mod tests {
     fn registry_count() {
         // Lock the surface so additions are deliberate. Update this number
         // intentionally when adding/removing tools.
-        assert_eq!(registry().len(), 48);
+        assert_eq!(registry().len(), 51);
     }
 
     #[test]
@@ -1715,5 +1877,83 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, DispatchError::InvalidArgs { .. }));
+    }
+
+    #[test]
+    fn a11y_tree_forwards_with_defaults() {
+        let d = dispatch("a11y_tree", serde_json::json!({})).unwrap();
+        match d {
+            Dispatch::Forward(Request::A11yTree { pid, max_nodes }) => {
+                assert_eq!(pid, None, "pid defaults to focused window (None)");
+                assert_eq!(max_nodes, None);
+            }
+            other => panic!("expected Forward(A11yTree), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a11y_find_forwards_query_and_role() {
+        let d = dispatch(
+            "a11y_find",
+            serde_json::json!({"query": "Submit", "role": "push button", "pid": 4321}),
+        )
+        .unwrap();
+        match d {
+            Dispatch::Forward(Request::A11yFind { pid, query, role, .. }) => {
+                assert_eq!(pid, Some(4321));
+                assert_eq!(query, "Submit");
+                assert_eq!(role.as_deref(), Some("push button"));
+            }
+            other => panic!("expected Forward(A11yFind), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a11y_click_defaults_to_dry_run() {
+        let d = dispatch("a11y_click", serde_json::json!({"query": "OK"})).unwrap();
+        match d {
+            Dispatch::A11yClick(op) => {
+                assert!(op.dry_run, "a11y_click MUST default to dry_run=true");
+                assert_eq!(op.match_index, 0);
+                assert!(op.require_unique);
+                assert!(matches!(op.button, MouseButton::Left));
+            }
+            other => panic!("expected A11yClick, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a11y_click_rejects_empty_query() {
+        let err = dispatch("a11y_click", serde_json::json!({"query": "  "})).unwrap_err();
+        assert!(matches!(err, DispatchError::InvalidArgs { .. }));
+    }
+
+    #[test]
+    fn a11y_click_rejects_bad_button() {
+        let err = dispatch("a11y_click", serde_json::json!({"query": "OK", "button": "nope"}))
+            .unwrap_err();
+        assert!(matches!(err, DispatchError::InvalidArgs { .. }));
+    }
+
+    #[test]
+    fn a11y_read_tools_are_in_a11y_group_and_not_mutating() {
+        let reg = registry();
+        for name in ["a11y_tree", "a11y_find"] {
+            let t = reg.iter().find(|t| t.name == name).expect("a11y tool in registry");
+            assert_eq!(t.group, crate::capability::ToolGroup::A11y);
+            assert!(!t.mutating);
+        }
+        let click = reg.iter().find(|t| t.name == "a11y_click").unwrap();
+        assert_eq!(click.group, crate::capability::ToolGroup::Input, "a11y_click moves the mouse");
+        assert!(click.mutating);
+    }
+
+    #[test]
+    fn default_profile_excludes_a11y_tools() {
+        let p = crate::capability::Profile::default_safe();
+        for name in ["a11y_tree", "a11y_find", "a11y_click"] {
+            let group = registry().iter().find(|t| t.name == name).unwrap().group;
+            assert!(!p.allows(name, group), "default profile must NOT permit `{name}`");
+        }
     }
 }

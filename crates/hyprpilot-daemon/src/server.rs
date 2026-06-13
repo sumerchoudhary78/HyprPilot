@@ -19,6 +19,7 @@ use hyprpilot_core::dispatch::FullscreenMode;
 use hyprpilot_core::selector::{WindowSelector, WorkspaceRef};
 use hyprpilot_core::types::Client as HyprClient;
 use hyprpilot_core::{Connection, Error as CoreError};
+use hyprpilot_a11y::{A11y, A11yError, WalkOpts};
 use hyprpilot_input::keys::{KeyCombo, MouseButton};
 use hyprpilot_input::{InputError, InputRunner};
 
@@ -45,6 +46,11 @@ struct State {
     /// Input dispatchers refuse on false with `input_disabled`.
     input_enabled: bool,
     input_runner: Arc<InputRunner>,
+    /// Lazily-established accessibility-bus connection, shared across clients.
+    /// `None` until first use or after a connection-level failure (next a11y
+    /// request reconnects). The a11y bus may be absent entirely — requests
+    /// then fail cleanly with `a11y_unavailable`.
+    a11y: Arc<Mutex<Option<A11y>>>,
 }
 
 pub async fn run(socket_path: PathBuf) -> AnyResult<()> {
@@ -125,6 +131,7 @@ pub async fn run(socket_path: PathBuf) -> AnyResult<()> {
         shutdown: Arc::new(Notify::new()),
         input_enabled,
         input_runner,
+        a11y: Arc::new(Mutex::new(None)),
     };
 
     // Keep the cache warm for the daemon's lifetime. Read-only; detached
@@ -348,6 +355,12 @@ async fn handle_request(state: &State, req: Request) -> Response {
             input_mouse_move(state, x, y, absolute).await
         }
         Request::InputMouseClick { button } => input_mouse_click(state, button).await,
+
+        // ---- accessibility (AT-SPI) ----------------------------------------
+        Request::A11yTree { pid, max_nodes } => a11y_tree(state, pid, max_nodes).await,
+        Request::A11yFind { pid, query, role, max_nodes } => {
+            a11y_find(state, pid, query, role, max_nodes).await
+        }
     }
 }
 
@@ -439,6 +452,100 @@ async fn input_mouse_click(state: &State, button: MouseButton) -> Response {
     match state.input_runner.mouse_click(button).await {
         Ok(()) => Response::ok(serde_json::json!({ "clicked": button })),
         Err(e) => input_error_response(e),
+    }
+}
+
+// ---- accessibility helpers ------------------------------------------------
+
+/// Lazily connect to the a11y bus, caching the connection in `State`.
+async fn a11y_conn(state: &State) -> Result<A11y, A11yError> {
+    let mut guard = state.a11y.lock().await;
+    if guard.is_none() {
+        *guard = Some(A11y::connect().await?);
+    }
+    Ok(guard.as_ref().expect("just connected").clone())
+}
+
+/// Map an [`A11yError`] to an RPC response, dropping the cached connection on
+/// a bus-availability failure so the next request reconnects.
+async fn a11y_error_response(state: &State, e: A11yError) -> Response {
+    let code = match &e {
+        A11yError::Unavailable(_) => {
+            *state.a11y.lock().await = None;
+            codes::A11Y_UNAVAILABLE
+        }
+        A11yError::NoApplication(_) => codes::A11Y_NO_APP,
+        A11yError::Bus(_) => codes::A11Y_FAILED,
+    };
+    Response::err(code, e.to_string())
+}
+
+fn walk_opts(max_nodes: Option<usize>) -> WalkOpts {
+    let mut opts = WalkOpts::default();
+    if let Some(n) = max_nodes.filter(|n| *n > 0) {
+        opts.max_nodes = n;
+    }
+    opts
+}
+
+/// Resolve the pid to introspect: the caller's `pid`, or the focused window's
+/// pid from the world-model cache.
+async fn resolve_a11y_pid(state: &State, pid: Option<i32>) -> Result<i32, Response> {
+    if let Some(p) = pid {
+        return Ok(p);
+    }
+    match state.cache.active_window().await {
+        Ok(Some(c)) => Ok(c.pid),
+        Ok(None) => Err(Response::err(
+            codes::A11Y_NO_APP,
+            "no focused window to resolve a pid from; pass `pid` explicitly",
+        )),
+        Err(e) => Err(core_error(e)),
+    }
+}
+
+async fn a11y_tree(state: &State, pid: Option<i32>, max_nodes: Option<usize>) -> Response {
+    let pid = match resolve_a11y_pid(state, pid).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let a11y = match a11y_conn(state).await {
+        Ok(a) => a,
+        Err(e) => return a11y_error_response(state, e).await,
+    };
+    match a11y.snapshot_app(pid, walk_opts(max_nodes)).await {
+        Ok(elements) => Response::ok(serde_json::json!({
+            "pid": pid,
+            "count": elements.len(),
+            "elements": elements,
+        })),
+        Err(e) => a11y_error_response(state, e).await,
+    }
+}
+
+async fn a11y_find(
+    state: &State,
+    pid: Option<i32>,
+    query: String,
+    role: Option<String>,
+    max_nodes: Option<usize>,
+) -> Response {
+    let pid = match resolve_a11y_pid(state, pid).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let a11y = match a11y_conn(state).await {
+        Ok(a) => a,
+        Err(e) => return a11y_error_response(state, e).await,
+    };
+    match a11y.find(pid, &query, role.as_deref(), walk_opts(max_nodes)).await {
+        Ok(elements) => Response::ok(serde_json::json!({
+            "pid": pid,
+            "query": query,
+            "count": elements.len(),
+            "elements": elements,
+        })),
+        Err(e) => a11y_error_response(state, e).await,
     }
 }
 
