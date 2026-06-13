@@ -22,6 +22,7 @@ use hyprpilot_core::{Connection, Error as CoreError};
 use hyprpilot_input::keys::{KeyCombo, MouseButton};
 use hyprpilot_input::{InputError, InputRunner};
 
+use crate::cache::{self, StateCache};
 use crate::protocol::{
     codes, Request, RequestEnvelope, Response, ResponseEnvelope, UndoListEntry,
 };
@@ -34,6 +35,10 @@ const UNDO_CAPACITY: usize = 64;
 #[derive(Clone)]
 struct State {
     hypr: Connection,
+    /// Event-warmed world-model cache. Read-only queries are served from
+    /// here; mutating handlers still read `hypr` live for authoritative
+    /// pre-mutation state (undo capture, selector matching).
+    cache: StateCache,
     undo: Arc<Mutex<UndoStack>>,
     shutdown: Arc<Notify>,
     /// True when HYPRPILOT_DANGEROUS_INPUT_OK=1 was set at startup.
@@ -67,6 +72,9 @@ pub async fn run(socket_path: PathBuf) -> AnyResult<()> {
     let hypr = Connection::new().context("connect to Hyprland")?;
     let version = hypr.version().await.context("Hyprland version probe")?;
     info!(version = %version.version, "connected to Hyprland");
+
+    // World-model cache, kept warm by its own event-socket subscription.
+    let cache = StateCache::new(hypr.clone());
 
     let mut undo_stack = UndoStack::with_capacity(UNDO_CAPACITY);
     let persist_path = default_persist_path();
@@ -112,11 +120,22 @@ pub async fn run(socket_path: PathBuf) -> AnyResult<()> {
 
     let state = State {
         hypr,
+        cache: cache.clone(),
         undo: Arc::new(Mutex::new(undo_stack)),
         shutdown: Arc::new(Notify::new()),
         input_enabled,
         input_runner,
     };
+
+    // Keep the cache warm for the daemon's lifetime. Read-only; detached
+    // because it has no cleanup — the runtime drops it on daemon exit. If the
+    // event socket closes (Hyprland gone) it logs and returns; the MAX_AGE
+    // backstop keeps queries correct in the meantime.
+    tokio::spawn(async move {
+        if let Err(e) = cache::run(cache).await {
+            error!(error = %e, "state cache task exited with error");
+        }
+    });
 
     // Rules engine. Loads $XDG_CONFIG_HOME/hyprpilot/rules.toml if present;
     // if absent, the engine task still starts but is idle. Config parse
@@ -247,15 +266,16 @@ async fn handle_request(state: &State, req: Request) -> Response {
             Response::ok("shutting_down")
         }
 
-        // ---- queries -------------------------------------------------------
-        Request::QueryClients => from_core(state.hypr.clients().await),
-        Request::QueryWorkspaces => from_core(state.hypr.workspaces().await),
-        Request::QueryMonitors => from_core(state.hypr.monitors().await),
-        Request::QueryActiveWindow => from_core(state.hypr.active_window().await),
-        Request::QueryActiveWorkspace => from_core(state.hypr.active_workspace().await),
-        Request::QueryVersion => from_core(state.hypr.version().await),
+        // ---- queries (cache-served; see `crate::cache`) --------------------
+        Request::QueryClients => from_core(state.cache.clients().await),
+        Request::QueryWorkspaces => from_core(state.cache.workspaces().await),
+        Request::QueryMonitors => from_core(state.cache.monitors().await),
+        Request::QueryActiveWindow => from_core(state.cache.active_window().await),
+        Request::QueryActiveWorkspace => from_core(state.cache.active_workspace().await),
+        Request::QueryVersion => from_core(state.cache.version().await),
+        // Cursor moves continuously with no event to invalidate on; query live.
         Request::QueryCursorPos => from_core(state.hypr.cursor_position().await),
-        Request::QueryBinds => from_core(state.hypr.binds().await),
+        Request::QueryBinds => from_core(state.cache.binds().await),
 
         // ---- mutating, recorded for undo -----------------------------------
         Request::DispatchKillActive => kill_active_recorded(state).await,

@@ -9,6 +9,7 @@
 //! [`client::DaemonClient`], and [`socket::default_socket_path`].
 
 pub mod actions;
+pub mod cache;
 pub mod client;
 pub mod engine;
 pub mod protocol;
