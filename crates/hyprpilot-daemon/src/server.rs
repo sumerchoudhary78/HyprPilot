@@ -19,9 +19,11 @@ use hyprpilot_core::dispatch::FullscreenMode;
 use hyprpilot_core::selector::{WindowSelector, WorkspaceRef};
 use hyprpilot_core::types::Client as HyprClient;
 use hyprpilot_core::{Connection, Error as CoreError};
+use hyprpilot_a11y::{A11y, A11yError, WalkOpts};
 use hyprpilot_input::keys::{KeyCombo, MouseButton};
 use hyprpilot_input::{InputError, InputRunner};
 
+use crate::cache::{self, StateCache};
 use crate::protocol::{
     codes, Request, RequestEnvelope, Response, ResponseEnvelope, UndoListEntry,
 };
@@ -34,12 +36,21 @@ const UNDO_CAPACITY: usize = 64;
 #[derive(Clone)]
 struct State {
     hypr: Connection,
+    /// Event-warmed world-model cache. Read-only queries are served from
+    /// here; mutating handlers still read `hypr` live for authoritative
+    /// pre-mutation state (undo capture, selector matching).
+    cache: StateCache,
     undo: Arc<Mutex<UndoStack>>,
     shutdown: Arc<Notify>,
     /// True when HYPRPILOT_DANGEROUS_INPUT_OK=1 was set at startup.
     /// Input dispatchers refuse on false with `input_disabled`.
     input_enabled: bool,
     input_runner: Arc<InputRunner>,
+    /// Lazily-established accessibility-bus connection, shared across clients.
+    /// `None` until first use or after a connection-level failure (next a11y
+    /// request reconnects). The a11y bus may be absent entirely — requests
+    /// then fail cleanly with `a11y_unavailable`.
+    a11y: Arc<Mutex<Option<A11y>>>,
 }
 
 pub async fn run(socket_path: PathBuf) -> AnyResult<()> {
@@ -67,6 +78,9 @@ pub async fn run(socket_path: PathBuf) -> AnyResult<()> {
     let hypr = Connection::new().context("connect to Hyprland")?;
     let version = hypr.version().await.context("Hyprland version probe")?;
     info!(version = %version.version, "connected to Hyprland");
+
+    // World-model cache, kept warm by its own event-socket subscription.
+    let cache = StateCache::new(hypr.clone());
 
     let mut undo_stack = UndoStack::with_capacity(UNDO_CAPACITY);
     let persist_path = default_persist_path();
@@ -112,11 +126,23 @@ pub async fn run(socket_path: PathBuf) -> AnyResult<()> {
 
     let state = State {
         hypr,
+        cache: cache.clone(),
         undo: Arc::new(Mutex::new(undo_stack)),
         shutdown: Arc::new(Notify::new()),
         input_enabled,
         input_runner,
+        a11y: Arc::new(Mutex::new(None)),
     };
+
+    // Keep the cache warm for the daemon's lifetime. Read-only; detached
+    // because it has no cleanup — the runtime drops it on daemon exit. If the
+    // event socket closes (Hyprland gone) it logs and returns; the MAX_AGE
+    // backstop keeps queries correct in the meantime.
+    tokio::spawn(async move {
+        if let Err(e) = cache::run(cache).await {
+            error!(error = %e, "state cache task exited with error");
+        }
+    });
 
     // Rules engine. Loads $XDG_CONFIG_HOME/hyprpilot/rules.toml if present;
     // if absent, the engine task still starts but is idle. Config parse
@@ -247,15 +273,16 @@ async fn handle_request(state: &State, req: Request) -> Response {
             Response::ok("shutting_down")
         }
 
-        // ---- queries -------------------------------------------------------
-        Request::QueryClients => from_core(state.hypr.clients().await),
-        Request::QueryWorkspaces => from_core(state.hypr.workspaces().await),
-        Request::QueryMonitors => from_core(state.hypr.monitors().await),
-        Request::QueryActiveWindow => from_core(state.hypr.active_window().await),
-        Request::QueryActiveWorkspace => from_core(state.hypr.active_workspace().await),
-        Request::QueryVersion => from_core(state.hypr.version().await),
+        // ---- queries (cache-served; see `crate::cache`) --------------------
+        Request::QueryClients => from_core(state.cache.clients().await),
+        Request::QueryWorkspaces => from_core(state.cache.workspaces().await),
+        Request::QueryMonitors => from_core(state.cache.monitors().await),
+        Request::QueryActiveWindow => from_core(state.cache.active_window().await),
+        Request::QueryActiveWorkspace => from_core(state.cache.active_workspace().await),
+        Request::QueryVersion => from_core(state.cache.version().await),
+        // Cursor moves continuously with no event to invalidate on; query live.
         Request::QueryCursorPos => from_core(state.hypr.cursor_position().await),
-        Request::QueryBinds => from_core(state.hypr.binds().await),
+        Request::QueryBinds => from_core(state.cache.binds().await),
 
         // ---- mutating, recorded for undo -----------------------------------
         Request::DispatchKillActive => kill_active_recorded(state).await,
@@ -328,6 +355,17 @@ async fn handle_request(state: &State, req: Request) -> Response {
             input_mouse_move(state, x, y, absolute).await
         }
         Request::InputMouseClick { button } => input_mouse_click(state, button).await,
+
+        // ---- accessibility (AT-SPI) ----------------------------------------
+        Request::A11yTree { pid, max_nodes } => a11y_tree(state, pid, max_nodes).await,
+        Request::A11yFind { pid, query, role, max_nodes } => {
+            a11y_find(state, pid, query, role, max_nodes).await
+        }
+
+        // ---- keymap --------------------------------------------------------
+        Request::RunBind { combo, submap, dry_run } => {
+            run_bind(state, combo, submap, dry_run).await
+        }
     }
 }
 
@@ -419,6 +457,141 @@ async fn input_mouse_click(state: &State, button: MouseButton) -> Response {
     match state.input_runner.mouse_click(button).await {
         Ok(()) => Response::ok(serde_json::json!({ "clicked": button })),
         Err(e) => input_error_response(e),
+    }
+}
+
+// ---- accessibility helpers ------------------------------------------------
+
+/// Lazily connect to the a11y bus, caching the connection in `State`.
+async fn a11y_conn(state: &State) -> Result<A11y, A11yError> {
+    let mut guard = state.a11y.lock().await;
+    if guard.is_none() {
+        *guard = Some(A11y::connect().await?);
+    }
+    Ok(guard.as_ref().expect("just connected").clone())
+}
+
+/// Map an [`A11yError`] to an RPC response, dropping the cached connection on
+/// a bus-availability failure so the next request reconnects.
+async fn a11y_error_response(state: &State, e: A11yError) -> Response {
+    let code = match &e {
+        A11yError::Unavailable(_) => {
+            *state.a11y.lock().await = None;
+            codes::A11Y_UNAVAILABLE
+        }
+        A11yError::NoApplication(_) => codes::A11Y_NO_APP,
+        A11yError::Bus(_) => codes::A11Y_FAILED,
+    };
+    Response::err(code, e.to_string())
+}
+
+fn walk_opts(max_nodes: Option<usize>) -> WalkOpts {
+    let mut opts = WalkOpts::default();
+    if let Some(n) = max_nodes.filter(|n| *n > 0) {
+        opts.max_nodes = n;
+    }
+    opts
+}
+
+/// Resolve the pid to introspect: the caller's `pid`, or the focused window's
+/// pid from the world-model cache.
+async fn resolve_a11y_pid(state: &State, pid: Option<i32>) -> Result<i32, Response> {
+    if let Some(p) = pid {
+        return Ok(p);
+    }
+    match state.cache.active_window().await {
+        Ok(Some(c)) => Ok(c.pid),
+        Ok(None) => Err(Response::err(
+            codes::A11Y_NO_APP,
+            "no focused window to resolve a pid from; pass `pid` explicitly",
+        )),
+        Err(e) => Err(core_error(e)),
+    }
+}
+
+async fn a11y_tree(state: &State, pid: Option<i32>, max_nodes: Option<usize>) -> Response {
+    let pid = match resolve_a11y_pid(state, pid).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let a11y = match a11y_conn(state).await {
+        Ok(a) => a,
+        Err(e) => return a11y_error_response(state, e).await,
+    };
+    match a11y.snapshot_app(pid, walk_opts(max_nodes)).await {
+        Ok(elements) => Response::ok(serde_json::json!({
+            "pid": pid,
+            "count": elements.len(),
+            "elements": elements,
+        })),
+        Err(e) => a11y_error_response(state, e).await,
+    }
+}
+
+async fn a11y_find(
+    state: &State,
+    pid: Option<i32>,
+    query: String,
+    role: Option<String>,
+    max_nodes: Option<usize>,
+) -> Response {
+    let pid = match resolve_a11y_pid(state, pid).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let a11y = match a11y_conn(state).await {
+        Ok(a) => a,
+        Err(e) => return a11y_error_response(state, e).await,
+    };
+    match a11y.find(pid, &query, role.as_deref(), walk_opts(max_nodes)).await {
+        Ok(elements) => Response::ok(serde_json::json!({
+            "pid": pid,
+            "query": query,
+            "count": elements.len(),
+            "elements": elements,
+        })),
+        Err(e) => a11y_error_response(state, e).await,
+    }
+}
+
+/// `run_bind`: resolve the user's keybind for `combo` and dispatch its action
+/// directly (no key synthesis). Reads binds from the world-model cache.
+async fn run_bind(
+    state: &State,
+    combo: KeyCombo,
+    submap: Option<String>,
+    dry_run: bool,
+) -> Response {
+    let binds = match state.cache.binds().await {
+        Ok(b) => b,
+        Err(e) => return core_error(e),
+    };
+    let Some(bind) = crate::binds::resolve(&binds, &combo, submap.as_deref()) else {
+        let scope = match &submap {
+            Some(s) => format!(" in submap `{s}`"),
+            None => String::new(),
+        };
+        return Response::err(
+            codes::BIND_NOT_FOUND,
+            format!("no keybind matches `{combo}`{scope}"),
+        );
+    };
+    let action = crate::binds::bind_action(bind);
+    if dry_run {
+        return Response::ok(serde_json::json!({
+            "dry_run": true,
+            "combo": combo.to_string(),
+            "dispatcher": bind.dispatcher.clone(),
+            "arg": bind.arg.clone(),
+            "would_dispatch": action,
+        }));
+    }
+    match state.hypr.dispatch(&action).await {
+        Ok(()) => Response::ok(serde_json::json!({
+            "ran": combo.to_string(),
+            "dispatched": action,
+        })),
+        Err(e) => core_error(e),
     }
 }
 

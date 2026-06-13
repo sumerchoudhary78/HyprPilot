@@ -105,6 +105,29 @@ pub enum Request {
     InputMouseMove { x: i32, y: i32, absolute: bool },
     /// Press + release a mouse button via ydotool.
     InputMouseClick { button: MouseButton },
+
+    /// Dump the accessibility (AT-SPI) tree of an application as a flat list
+    /// of elements. `pid` defaults to the focused window's pid (from the
+    /// world-model cache). `max_nodes` bounds the walk.
+    A11yTree { pid: Option<i32>, max_nodes: Option<usize> },
+    /// Find accessibility elements whose name/text matches `query` (and,
+    /// optionally, whose role equals `role`). `pid` defaults to the focused
+    /// window's pid. Returns elements with window-relative extents.
+    A11yFind {
+        pid: Option<i32>,
+        query: String,
+        role: Option<String>,
+        max_nodes: Option<usize>,
+    },
+
+    /// Look up the user's keybind for `combo` (in `submap`, default global)
+    /// and dispatch its action in the compositor — driving the user's keymap
+    /// without synthesising a keypress. Bounded to configured binds.
+    ///
+    /// Carries `dry_run` (unlike other mutating ops, which gate dry-run in the
+    /// MCP layer) because the preview must resolve the bind, which only the
+    /// daemon can do.
+    RunBind { combo: KeyCombo, submap: Option<String>, dry_run: bool },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +181,16 @@ pub mod codes {
     pub const INPUT_INVALID: &str = "input_invalid";
     /// Backend ran but exited non-zero.
     pub const INPUT_FAILED: &str = "input_failed";
+    /// The accessibility bus (`org.a11y.Bus`) is not reachable — the launcher
+    /// isn't running or accessibility is disabled in the session.
+    pub const A11Y_UNAVAILABLE: &str = "a11y_unavailable";
+    /// No AT-SPI application matched the requested pid (the app may not expose
+    /// accessibility — e.g. a terminal, game, or Electron app without the flag).
+    pub const A11Y_NO_APP: &str = "a11y_no_app";
+    /// An AT-SPI D-Bus call failed mid-walk.
+    pub const A11Y_FAILED: &str = "a11y_failed";
+    /// No configured keybind matched the requested chord (`run_bind`).
+    pub const BIND_NOT_FOUND: &str = "bind_not_found";
     pub const INTERNAL: &str = "internal";
 }
 

@@ -16,8 +16,9 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, warn};
 
+use hyprpilot_a11y::Element;
 use hyprpilot_core::snapshot::SnapshotRestorePreview;
-use hyprpilot_core::types::Monitor;
+use hyprpilot_core::types::{Client, Monitor};
 use hyprpilot_daemon::client::{ClientError, DaemonClient};
 use hyprpilot_daemon::protocol::Request;
 use hyprpilot_vision::{
@@ -31,7 +32,9 @@ use crate::protocol::{
     JsonRpcRequest, JsonRpcResponse, ListToolsResult, ServerCapabilities, ServerInfo, Tool,
     PROTOCOL_VERSION,
 };
-use crate::tools::{self, CaptureOp, ClickTextOp, Dispatch, DispatchError, FindTextOp, OcrOp, ToolDef};
+use crate::tools::{
+    self, A11yClickOp, CaptureOp, ClickTextOp, Dispatch, DispatchError, FindTextOp, OcrOp, ToolDef,
+};
 
 pub struct Server {
     profile: Profile,
@@ -215,16 +218,29 @@ impl Server {
                 self.preview_snapshot_restore(id, name).await
             }
             Dispatch::Capture(op) => handle_capture(id, op).await,
-            Dispatch::Ocr(op) => handle_ocr(id, op).await,
-            Dispatch::FindText(op) => handle_find_text(id, op).await,
+            Dispatch::Ocr(op) => self.handle_ocr(id, op).await,
+            Dispatch::FindText(op) => self.handle_find_text(id, op).await,
             Dispatch::ClickText(op) => self.handle_click_text(id, op).await,
+            Dispatch::A11yClick(op) => self.handle_a11y_click(id, op).await,
         }
     }
 
     async fn handle_click_text(&mut self, id: Value, op: ClickTextOp) -> JsonRpcResponse {
+        // Effective scan region: the focused window (from the cache) when
+        // `active_window` is set, otherwise the explicit region (or full
+        // screen). dispatch() already rejected setting both.
+        let region = if op.active_window {
+            match self.resolve_active_window_region(&id).await {
+                Ok(r) => Some(r),
+                Err(resp) => return resp,
+            }
+        } else {
+            op.region
+        };
+
         // Stage 1: vision (daemon-bypass — capture + OCR run locally).
         let matches = match scan_for_matches(
-            op.region.as_ref().copied(),
+            region,
             &op.query,
             op.case_sensitive,
             op.min_confidence,
@@ -267,7 +283,7 @@ impl Server {
         // monitor's scale. Query monitors so we can map back.
         let scale = match self.call_daemon(Request::QueryMonitors).await {
             Ok(v) => match serde_json::from_value::<Vec<Monitor>>(v) {
-                Ok(ms) => pick_scale(&ms, op.region.as_ref()),
+                Ok(ms) => pick_scale(&ms, region.as_ref()),
                 Err(e) => {
                     return tool_error(
                         id,
@@ -287,7 +303,7 @@ impl Server {
         let (cx_img, cy_img) = chosen.bbox.center();
         let cx_logical = ((cx_img as f64) / scale).round() as i32;
         let cy_logical = ((cy_img as f64) / scale).round() as i32;
-        let (cx, cy) = match op.region {
+        let (cx, cy) = match region {
             Some(r) => (cx_logical + r.x, cy_logical + r.y),
             None => (cx_logical, cy_logical),
         };
@@ -316,6 +332,134 @@ impl Server {
         }
 
         let body = render_click_applied(chosen, total, cx, cy);
+        JsonRpcResponse::ok(
+            id,
+            CallToolResult { content: vec![Content::text(body)], is_error: false },
+        )
+    }
+
+    /// `a11y_click`: find an element by label/role via the daemon, turn its
+    /// window-relative box into a screen point using the window's geometry,
+    /// then (unless dry-run) move + click.
+    ///
+    /// Coordinate model: AT-SPI window-relative extents and Hyprland's window
+    /// `at` are both treated as logical compositor pixels, so the click point
+    /// is simply `window.at + element.center`. The dry-run preview surfaces
+    /// every input (window origin, element box, result) so a wrong assumption
+    /// is visible before anything moves.
+    async fn handle_a11y_click(&mut self, id: Value, op: A11yClickOp) -> JsonRpcResponse {
+        // Stage 1: find candidates via the daemon's a11y walk.
+        let find = Request::A11yFind {
+            pid: op.pid,
+            query: op.query.clone(),
+            role: op.role.clone(),
+            max_nodes: op.max_nodes,
+        };
+        let value = match self.call_daemon(find).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.daemon = None;
+                let (code, message) = classify_daemon_error(&e);
+                return tool_error(id, code, message);
+            }
+        };
+        let resolved_pid = value.get("pid").and_then(Value::as_i64).map(|n| n as i32);
+        let elements: Vec<Element> = match value.get("elements").cloned() {
+            Some(v) => match serde_json::from_value(v) {
+                Ok(els) => els,
+                Err(e) => {
+                    return tool_error(
+                        id,
+                        ErrorCode::ToolExecution,
+                        format!("daemon returned malformed a11y elements: {e}"),
+                    );
+                }
+            },
+            None => Vec::new(),
+        };
+
+        // Only positive-area elements are clickable targets.
+        let matches: Vec<Element> = elements.into_iter().filter(Element::is_clickable).collect();
+        if matches.is_empty() {
+            return tool_error(
+                id,
+                ErrorCode::ToolExecution,
+                format!("no clickable accessibility element matched `{}`", op.query),
+            );
+        }
+        let total = matches.len();
+        if op.require_unique && total > 1 && op.match_index == 0 {
+            return tool_error(id, ErrorCode::ToolExecution, render_a11y_ambiguity(&op.query, &matches));
+        }
+        if op.match_index >= total {
+            return tool_error(
+                id,
+                ErrorCode::InvalidParams,
+                format!(
+                    "match_index {} out of bounds: only {} clickable match(es) for `{}`",
+                    op.match_index, total, op.query
+                ),
+            );
+        }
+        let chosen = matches[op.match_index].clone();
+
+        // Stage 2: anchor the window-relative box to the window's screen origin.
+        let Some(pid) = resolved_pid else {
+            return tool_error(
+                id,
+                ErrorCode::ToolExecution,
+                "daemon did not report a resolved pid to anchor the click".to_string(),
+            );
+        };
+        let clients = match self.call_daemon(Request::QueryClients).await {
+            Ok(v) => match serde_json::from_value::<Vec<Client>>(v) {
+                Ok(c) => c,
+                Err(e) => {
+                    return tool_error(
+                        id,
+                        ErrorCode::ToolExecution,
+                        format!("daemon returned malformed clients: {e}"),
+                    );
+                }
+            },
+            Err(e) => {
+                self.daemon = None;
+                let (code, message) = classify_daemon_error(&e);
+                return tool_error(id, code, message);
+            }
+        };
+        let Some(window) = pick_window_for_pid(&clients, pid) else {
+            return tool_error(
+                id,
+                ErrorCode::ToolExecution,
+                format!("no window found for pid {pid} to anchor the click"),
+            );
+        };
+        let (ecx, ecy) = chosen.center();
+        let cx = window.at[0] + ecx;
+        let cy = window.at[1] + ecy;
+
+        if op.dry_run {
+            let body = render_a11y_click_preview(&op, &chosen, total, window, cx, cy);
+            return JsonRpcResponse::ok(
+                id,
+                CallToolResult { content: vec![Content::text(body)], is_error: false },
+            );
+        }
+
+        // Stage 3: drive input via the daemon (absolute move, then click).
+        if let Err(resp) = self
+            .run_input(id.clone(), Request::InputMouseMove { x: cx, y: cy, absolute: true })
+            .await
+        {
+            return resp;
+        }
+        if let Err(resp) =
+            self.run_input(id.clone(), Request::InputMouseClick { button: op.button }).await
+        {
+            return resp;
+        }
+        let body = render_a11y_click_applied(&chosen, total, cx, cy);
         JsonRpcResponse::ok(
             id,
             CallToolResult { content: vec![Content::text(body)], is_error: false },
@@ -455,9 +599,11 @@ async fn scan_for_matches(
     lang: &str,
 ) -> Result<Vec<TextMatch>, String> {
     let cap = GrimCapture::detect().map_err(|e| e.to_string())?;
+    // PPM (raw) not PNG: this image is piped straight into tesseract, never
+    // shown, so the lossless PNG encode is pure overhead.
     let bytes = match region {
-        Some(r) => cap.region(r, VisionImageFormat::Png).await,
-        None => cap.full(None, VisionImageFormat::Png).await,
+        Some(r) => cap.region(r, VisionImageFormat::Ppm).await,
+        None => cap.full(None, VisionImageFormat::Ppm).await,
     }
     .map_err(|e| e.to_string())?;
 
@@ -477,34 +623,82 @@ async fn scan_for_matches(
     Ok(matches)
 }
 
-async fn handle_find_text(id: Value, op: FindTextOp) -> JsonRpcResponse {
-    match scan_for_matches(
-        op.region,
-        &op.query,
-        op.case_sensitive,
-        op.min_confidence,
-        op.psm,
-        &op.lang,
-    )
-    .await
-    {
-        Ok(matches) => {
-            let body = serde_json::json!({
-                "query": op.query,
-                "match_count": matches.len(),
-                "matches": matches,
-            });
-            JsonRpcResponse::ok(
-                id,
-                CallToolResult {
-                    content: vec![Content::text(
-                        serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string()),
-                    )],
-                    is_error: false,
-                },
-            )
+impl Server {
+    async fn handle_find_text(&mut self, id: Value, op: FindTextOp) -> JsonRpcResponse {
+        let region = if op.active_window {
+            match self.resolve_active_window_region(&id).await {
+                Ok(r) => Some(r),
+                Err(resp) => return resp,
+            }
+        } else {
+            op.region
+        };
+        match scan_for_matches(
+            region,
+            &op.query,
+            op.case_sensitive,
+            op.min_confidence,
+            op.psm,
+            &op.lang,
+        )
+        .await
+        {
+            Ok(matches) => {
+                let body = serde_json::json!({
+                    "query": op.query,
+                    "match_count": matches.len(),
+                    "matches": matches,
+                });
+                JsonRpcResponse::ok(
+                    id,
+                    CallToolResult {
+                        content: vec![Content::text(
+                            serde_json::to_string_pretty(&body)
+                                .unwrap_or_else(|_| body.to_string()),
+                        )],
+                        is_error: false,
+                    },
+                )
+            }
+            Err(e) => tool_error(id, ErrorCode::ToolExecution, e),
         }
-        Err(e) => tool_error(id, ErrorCode::ToolExecution, e),
+    }
+
+    /// Resolve the focused window's rectangle (logical compositor coords) from
+    /// the daemon's world-model cache, for `active_window`-scoped vision.
+    async fn resolve_active_window_region(&mut self, id: &Value) -> Result<Region, JsonRpcResponse> {
+        let value = match self.call_daemon(Request::QueryActiveWindow).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.daemon = None;
+                let (code, message) = classify_daemon_error(&e);
+                return Err(tool_error(id.clone(), code, message));
+            }
+        };
+        let client: Option<Client> = serde_json::from_value(value).map_err(|e| {
+            tool_error(
+                id.clone(),
+                ErrorCode::ToolExecution,
+                format!("daemon returned malformed active window: {e}"),
+            )
+        })?;
+        let Some(c) = client else {
+            return Err(tool_error(
+                id.clone(),
+                ErrorCode::ToolExecution,
+                "no active window to scope to; focus a window or pass an explicit region"
+                    .to_string(),
+            ));
+        };
+        let (w, h) = (c.size[0], c.size[1]);
+        if w <= 0 || h <= 0 {
+            return Err(tool_error(
+                id.clone(),
+                ErrorCode::ToolExecution,
+                format!("active window `{}` has no positive size ({w}x{h})", c.class),
+            ));
+        }
+        Ok(Region { x: c.at[0], y: c.at[1], w: w as u32, h: h as u32 })
     }
 }
 
@@ -565,6 +759,89 @@ fn render_ambiguity(query: &str, matches: &[TextMatch]) -> String {
         out.push_str(&format!("  ... and {} more\n", matches.len() - 8));
     }
     out
+}
+
+/// Pick the window to anchor an a11y click to: prefer the focused window
+/// (`focusHistoryID == 0`) among the pid's windows, else the first match.
+fn pick_window_for_pid(clients: &[Client], pid: i32) -> Option<&Client> {
+    let mut fallback = None;
+    for c in clients {
+        if c.pid == pid {
+            if c.focus_history_id == 0 {
+                return Some(c);
+            }
+            fallback.get_or_insert(c);
+        }
+    }
+    fallback
+}
+
+fn render_a11y_ambiguity(query: &str, matches: &[Element]) -> String {
+    let mut out = format!(
+        "ambiguous: `{}` matched {} clickable accessibility elements. Pass \
+         `match_index` (0..{}) to pick one, or `require_unique: false` to take \
+         the first:\n",
+        query,
+        matches.len(),
+        matches.len().saturating_sub(1),
+    );
+    for (i, m) in matches.iter().enumerate().take(8) {
+        out.push_str(&format!(
+            "  [{i}] {role} `{name}` (window-rel {x},{y} {w}x{h})\n",
+            role = m.role,
+            name = m.name,
+            x = m.x,
+            y = m.y,
+            w = m.w,
+            h = m.h,
+        ));
+    }
+    if matches.len() > 8 {
+        out.push_str(&format!("  ... and {} more\n", matches.len() - 8));
+    }
+    out
+}
+
+fn render_a11y_click_preview(
+    op: &A11yClickOp,
+    chosen: &Element,
+    total: usize,
+    window: &Client,
+    cx: i32,
+    cy: i32,
+) -> String {
+    let (ecx, ecy) = chosen.center();
+    format!(
+        "[dry_run] a11y_click would {button:?}-click {role} `{name}` at compositor ({cx}, {cy}).\n\
+         window `{class}` origin ({wx}, {wy}) + element window-relative centre ({ecx}, {ecy}); \
+         box {x},{y} {w}x{h}; match {idx}/{total}.\n\n\
+         Pass `dry_run: false` to apply.",
+        button = op.button,
+        role = chosen.role,
+        name = chosen.name,
+        class = window.class,
+        wx = window.at[0],
+        wy = window.at[1],
+        x = chosen.x,
+        y = chosen.y,
+        w = chosen.w,
+        h = chosen.h,
+        idx = op.match_index,
+        total = total,
+    )
+}
+
+fn render_a11y_click_applied(chosen: &Element, total: usize, cx: i32, cy: i32) -> String {
+    let body = serde_json::json!({
+        "clicked": {
+            "role": chosen.role,
+            "name": chosen.name,
+            "window_rel": { "x": chosen.x, "y": chosen.y, "w": chosen.w, "h": chosen.h },
+        },
+        "click_at": { "x": cx, "y": cy },
+        "total_matches": total,
+    });
+    serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string())
 }
 
 fn tool_error(id: Value, code: ErrorCode, message: String) -> JsonRpcResponse {
@@ -652,37 +929,42 @@ async fn handle_capture(id: Value, op: CaptureOp) -> JsonRpcResponse {
 /// Run an OCR op: capture, then extract text. Returns a `text` content
 /// block. The OCR backend treats "no recognizable text" as `Ok("")` (not an
 /// error), so an empty string is a legitimate success result.
-async fn handle_ocr(id: Value, op: OcrOp) -> JsonRpcResponse {
-    let cap = match GrimCapture::detect() {
-        Ok(c) => c,
-        Err(e) => return tool_error(id, ErrorCode::ToolExecution, e.to_string()),
-    };
-    let (bytes_res, lang, psm) = match op {
-        OcrOp::Screen { lang, psm } => (
-            cap.full(None, hyprpilot_vision::ImageFormat::Png).await,
-            lang,
-            psm,
-        ),
-        OcrOp::Region { region, lang, psm } => (
-            cap.region(region, hyprpilot_vision::ImageFormat::Png).await,
-            lang,
-            psm,
-        ),
-    };
-    let bytes = match bytes_res {
-        Ok(b) => b,
-        Err(e) => return tool_error(id, ErrorCode::ToolExecution, e.to_string()),
-    };
-    let ocr = match TesseractOcr::detect() {
-        Ok(o) => o.with_lang(lang).with_psm(psm),
-        Err(e) => return tool_error(id, ErrorCode::ToolExecution, e.to_string()),
-    };
-    match ocr.extract_text(&bytes).await {
-        Ok(text) => JsonRpcResponse::ok(
-            id,
-            CallToolResult { content: vec![Content::text(text)], is_error: false },
-        ),
-        Err(e) => tool_error(id, ErrorCode::ToolExecution, e.to_string()),
+///
+/// Captures use PPM (raw): the bytes are piped to tesseract, never shown, so
+/// the PNG encode would be wasted work.
+impl Server {
+    async fn handle_ocr(&mut self, id: Value, op: OcrOp) -> JsonRpcResponse {
+        let (region, lang, psm) = match op {
+            OcrOp::Screen { lang, psm } => (None, lang, psm),
+            OcrOp::Region { region, lang, psm } => (Some(region), lang, psm),
+            OcrOp::ActiveWindow { lang, psm } => match self.resolve_active_window_region(&id).await {
+                Ok(r) => (Some(r), lang, psm),
+                Err(resp) => return resp,
+            },
+        };
+        let cap = match GrimCapture::detect() {
+            Ok(c) => c,
+            Err(e) => return tool_error(id, ErrorCode::ToolExecution, e.to_string()),
+        };
+        let bytes_res = match region {
+            Some(r) => cap.region(r, VisionImageFormat::Ppm).await,
+            None => cap.full(None, VisionImageFormat::Ppm).await,
+        };
+        let bytes = match bytes_res {
+            Ok(b) => b,
+            Err(e) => return tool_error(id, ErrorCode::ToolExecution, e.to_string()),
+        };
+        let ocr = match TesseractOcr::detect() {
+            Ok(o) => o.with_lang(lang).with_psm(psm),
+            Err(e) => return tool_error(id, ErrorCode::ToolExecution, e.to_string()),
+        };
+        match ocr.extract_text(&bytes).await {
+            Ok(text) => JsonRpcResponse::ok(
+                id,
+                CallToolResult { content: vec![Content::text(text)], is_error: false },
+            ),
+            Err(e) => tool_error(id, ErrorCode::ToolExecution, e.to_string()),
+        }
     }
 }
 

@@ -85,6 +85,11 @@ pub enum Dispatch {
     /// (via the daemon's input RPCs). Both vision and input touch points
     /// live here so the server can handle them in one place.
     ClickText(ClickTextOp),
+    /// Composite: find an accessibility element by label/role (daemon
+    /// A11yFind), turn its window-relative box into a screen point using the
+    /// window's geometry, and optionally click it. The a11y analogue of
+    /// `ClickText`, without OCR.
+    A11yClick(A11yClickOp),
 }
 
 /// What to capture and how. Image format is resolved here so we don't pass
@@ -112,13 +117,18 @@ pub enum OcrOp {
     Screen { lang: String, psm: Psm },
     /// OCR a specific region.
     Region { region: Region, lang: String, psm: Psm },
+    /// OCR the focused window's rectangle (resolved server-side from the
+    /// world-model cache). Far cheaper than a full-screen capture.
+    ActiveWindow { lang: String, psm: Psm },
 }
 
-/// What to scan for. `region=None` means full screen.
+/// What to scan for. `region=None` means full screen unless `active_window`
+/// is set, in which case the server scopes to the focused window's rectangle.
 #[derive(Debug)]
 pub struct FindTextOp {
     pub query: String,
     pub region: Option<Region>,
+    pub active_window: bool,
     pub case_sensitive: bool,
     pub min_confidence: i32,
     pub psm: Psm,
@@ -131,6 +141,7 @@ pub struct FindTextOp {
 pub struct ClickTextOp {
     pub query: String,
     pub region: Option<Region>,
+    pub active_window: bool,
     pub case_sensitive: bool,
     pub min_confidence: i32,
     pub psm: Psm,
@@ -138,6 +149,20 @@ pub struct ClickTextOp {
     pub button: hyprpilot_input::keys::MouseButton,
     pub match_index: usize,
     pub require_unique: bool,
+    pub dry_run: bool,
+}
+
+/// What to click via accessibility. `pid=None` targets the focused window's
+/// app (resolved daemon-side from the world-model cache).
+#[derive(Debug)]
+pub struct A11yClickOp {
+    pub query: String,
+    pub role: Option<String>,
+    pub pid: Option<i32>,
+    pub button: hyprpilot_input::keys::MouseButton,
+    pub match_index: usize,
+    pub require_unique: bool,
+    pub max_nodes: Option<usize>,
     pub dry_run: bool,
 }
 
@@ -449,6 +474,10 @@ pub struct OcrScreenArgs {
     /// default), 7 (single line), 11 (sparse text).
     #[serde(default = "default_psm")]
     pub psm: u8,
+    /// Scope OCR to the focused window's rectangle instead of the whole
+    /// compositor. Much cheaper (one window, not a 4K frame). Default false.
+    #[serde(default)]
+    pub active_window: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -520,6 +549,11 @@ pub struct FindTextPositionArgs {
     /// Tesseract language code (e.g. `eng`, `eng+fra`). Default `eng`.
     #[serde(default = "default_lang")]
     pub lang: String,
+    /// Scope the scan to the focused window's rectangle instead of the whole
+    /// screen (cheaper, fewer false matches). Cannot be combined with an
+    /// explicit x/y/w/h region. Default false.
+    #[serde(default)]
+    pub active_window: bool,
 }
 
 /// Inputs to the composite `click_text` tool. Superset of
@@ -543,6 +577,10 @@ pub struct ClickTextArgs {
     pub psm: u8,
     #[serde(default = "default_lang")]
     pub lang: String,
+    /// Scope the scan to the focused window's rectangle instead of the whole
+    /// screen. Cannot be combined with an explicit x/y/w/h region. Default false.
+    #[serde(default)]
+    pub active_window: bool,
     /// `left` (default), `right`, `middle`, `x1`/`back`, `x2`/`forward`.
     #[serde(default)]
     pub button: Option<String>,
@@ -557,6 +595,85 @@ pub struct ClickTextArgs {
     pub require_unique: bool,
     /// When true (default), do not move/click. Return what WOULD be
     /// clicked plus the centre coordinates. Pass `false` to apply.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct A11yTreeArgs {
+    /// Process id of the app to introspect. When omitted, the focused
+    /// window's pid is used (resolved from the world-model cache).
+    #[serde(default)]
+    pub pid: Option<i32>,
+    /// Cap on nodes walked. Default 1500. Large apps (browsers) are
+    /// truncated; scope by app or use `a11y_find` instead.
+    #[serde(default)]
+    pub max_nodes: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct A11yFindArgs {
+    /// Substring to match against each element's accessible name or inline
+    /// text (case-insensitive). Empty matches on `role` alone.
+    #[serde(default)]
+    pub query: String,
+    /// Restrict to this AT-SPI role. Role names vary by toolkit — GTK reports
+    /// `button`, Qt may report `push button`; other examples: `entry`,
+    /// `toggle button`, `check box`, `menu item`, `label`, `text`.
+    /// Case-insensitive, exact match. Omit if unsure and match by name.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Process id of the app to search. Omit to use the focused window.
+    #[serde(default)]
+    pub pid: Option<i32>,
+    /// Cap on nodes walked. Default 1500.
+    #[serde(default)]
+    pub max_nodes: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct A11yClickArgs {
+    /// Substring matched against the element's accessible name or inline text.
+    pub query: String,
+    /// Restrict to this AT-SPI role (GTK: `button`; Qt may use `push button`).
+    /// Useful to disambiguate — a control often appears as both a `button` and
+    /// a nested `label` of the same name. Case-insensitive.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Process id of the app. Omit to target the focused window's app.
+    #[serde(default)]
+    pub pid: Option<i32>,
+    /// `left` (default), `right`, `middle`, `x1`/`back`, `x2`/`forward`.
+    #[serde(default)]
+    pub button: Option<String>,
+    /// Which match to click when the query is ambiguous. Default 0.
+    #[serde(default)]
+    pub match_index: Option<usize>,
+    /// Fail loudly when more than one element matches and `match_index` was
+    /// not pinned. Default true.
+    #[serde(default = "default_true")]
+    pub require_unique: bool,
+    /// Cap on nodes walked. Default 1500.
+    #[serde(default)]
+    pub max_nodes: Option<usize>,
+    /// When true (default), do not move/click: return the matched element and
+    /// the computed screen coordinates. Pass `false` to apply.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct RunBindArgs {
+    /// Key chord to run, e.g. `super+1`, `super+return`, `super+shift+e`.
+    /// Same grammar as `input_keys`. Discover available chords with
+    /// `query_binds`.
+    pub combo: String,
+    /// Submap the bind lives in (default: the global submap). Only needed for
+    /// chords defined inside a Hyprland `submap`.
+    #[serde(default)]
+    pub submap: Option<String>,
+    /// When true (default), resolve the bind and report the action it would
+    /// dispatch without running it. Pass `false` to execute.
     #[serde(default = "default_true")]
     pub dry_run: bool,
 }
@@ -1003,6 +1120,64 @@ pub fn registry() -> Vec<ToolDef> {
              (NOT in the default profile) and the daemon's \
              HYPRPILOT_DANGEROUS_INPUT_OK=1 gate.",
         ),
+        // ---- Accessibility (group: a11y) — NOT in default profile -----------
+        def::<A11yTreeArgs>(
+            "a11y_tree",
+            A11y,
+            false,
+            "Read the accessibility (AT-SPI) tree of an application as a flat \
+             list of elements: role, accessible name, inline text, and a \
+             window-relative bounding box for each. Structured UI content \
+             WITHOUT a screenshot or OCR — prefer this over `ocr_screen` for \
+             reading app content when the app exposes accessibility. `pid` \
+             defaults to the focused window. Coverage is toolkit-dependent \
+             (GTK/Qt/Firefox expose rich trees; terminals, games, and some \
+             Electron apps expose little) — fall back to vision when empty. \
+             Read-only. The `a11y` capability group is NOT in the default \
+             profile (a field's text may be sensitive).",
+        ),
+        def::<A11yFindArgs>(
+            "a11y_find",
+            A11y,
+            false,
+            "Find accessibility elements whose name or text matches `query` \
+             (and, optionally, whose role equals `role` — GTK reports \
+             `button`, Qt may report `push button`; omit if unsure). \
+             Returns matches with window-relative bounding boxes. The \
+             structured, OCR-free analogue of `find_text_position`, and the \
+             first half of a click-by-label flow. `pid` defaults to the \
+             focused window. Read-only.",
+        ),
+        def::<A11yClickArgs>(
+            "a11y_click",
+            Input,
+            true,
+            "Find an accessibility element by label/role and click its centre. \
+             Composite of `a11y_find` + window geometry + `input_mouse_move` + \
+             `input_mouse_click` — no OCR, exact target box. dry_run defaults \
+             to true: returns the matched element and the computed screen \
+             coordinates (window origin + element box) without moving the \
+             cursor, so you can verify the target first. Requires the `input` \
+             capability group (NOT in the default profile) and the daemon's \
+             HYPRPILOT_DANGEROUS_INPUT_OK=1 gate.",
+        ),
+        // ---- Keymap (group: binds) — NOT in default profile -----------------
+        def::<RunBindArgs>(
+            "run_bind",
+            Binds,
+            true,
+            "Run the user's keybind for a chord (e.g. `super+1`, \
+             `super+return`) by dispatching the action it is bound to directly \
+             in the compositor — the way a human just presses the chord. \
+             Unlike `input_keys` this needs no key synthesis (no ydotool, no \
+             focus/timing fragility) and does NOT require the \
+             HYPRPILOT_DANGEROUS_INPUT_OK gate, because it is bounded to \
+             actions the user already configured. Discover chords with \
+             `query_binds`. dry_run defaults to true: returns the action that \
+             would be dispatched. NOTE: a bound action can be `exec`, so this \
+             can launch whatever the user bound; the `binds` capability group \
+             is NOT in the default profile.",
+        ),
     ]
 }
 
@@ -1263,7 +1438,11 @@ pub fn dispatch(name: &str, args: Value) -> Result<Dispatch, DispatchError> {
         "ocr_screen" => {
             let p: OcrScreenArgs = parse_args(name, args)?;
             let psm = parse_psm(name, p.psm)?;
-            Ok(Dispatch::Ocr(OcrOp::Screen { lang: p.lang, psm }))
+            Ok(Dispatch::Ocr(if p.active_window {
+                OcrOp::ActiveWindow { lang: p.lang, psm }
+            } else {
+                OcrOp::Screen { lang: p.lang, psm }
+            }))
         }
         "ocr_region" => {
             let p: OcrRegionArgs = parse_args(name, args)?;
@@ -1285,10 +1464,12 @@ pub fn dispatch(name: &str, args: Value) -> Result<Dispatch, DispatchError> {
                 });
             }
             let region = build_optional_region(name, p.x, p.y, p.w, p.h)?;
+            reject_region_with_active_window(name, region.is_some(), p.active_window)?;
             let psm = parse_psm(name, p.psm)?;
             Ok(Dispatch::FindText(FindTextOp {
                 query: p.query,
                 region,
+                active_window: p.active_window,
                 case_sensitive: p.case_sensitive,
                 min_confidence: p.min_confidence,
                 psm,
@@ -1305,6 +1486,7 @@ pub fn dispatch(name: &str, args: Value) -> Result<Dispatch, DispatchError> {
                 });
             }
             let region = build_optional_region(name, p.x, p.y, p.w, p.h)?;
+            reject_region_with_active_window(name, region.is_some(), p.active_window)?;
             let psm = parse_psm(name, p.psm)?;
             let button = match p.button.as_deref() {
                 None => MouseButton::Left,
@@ -1318,6 +1500,7 @@ pub fn dispatch(name: &str, args: Value) -> Result<Dispatch, DispatchError> {
             Ok(Dispatch::ClickText(ClickTextOp {
                 query: p.query,
                 region,
+                active_window: p.active_window,
                 case_sensitive: p.case_sensitive,
                 min_confidence: p.min_confidence,
                 psm,
@@ -1325,6 +1508,61 @@ pub fn dispatch(name: &str, args: Value) -> Result<Dispatch, DispatchError> {
                 button,
                 match_index: p.match_index.unwrap_or(0),
                 require_unique: p.require_unique,
+                dry_run: p.dry_run,
+            }))
+        }
+
+        // ---- keymap --------------------------------------------------------
+        "run_bind" => {
+            let p: RunBindArgs = parse_args(name, args)?;
+            let combo = parse_combo(name, &p.combo)?;
+            Ok(Dispatch::Forward(Request::RunBind {
+                combo,
+                submap: p.submap,
+                dry_run: p.dry_run,
+            }))
+        }
+
+        // ---- accessibility -------------------------------------------------
+        "a11y_tree" => {
+            let p: A11yTreeArgs = parse_args(name, args)?;
+            Ok(Dispatch::Forward(Request::A11yTree {
+                pid: p.pid,
+                max_nodes: p.max_nodes,
+            }))
+        }
+        "a11y_find" => {
+            let p: A11yFindArgs = parse_args(name, args)?;
+            Ok(Dispatch::Forward(Request::A11yFind {
+                pid: p.pid,
+                query: p.query,
+                role: p.role,
+                max_nodes: p.max_nodes,
+            }))
+        }
+        "a11y_click" => {
+            let p: A11yClickArgs = parse_args(name, args)?;
+            if p.query.trim().is_empty() {
+                return Err(DispatchError::InvalidArgs {
+                    tool: name.to_string(),
+                    message: "query must not be empty".into(),
+                });
+            }
+            let button = match p.button.as_deref() {
+                None => MouseButton::Left,
+                Some(s) => MouseButton::parse(s).map_err(|e| DispatchError::InvalidArgs {
+                    tool: name.to_string(),
+                    message: e.to_string(),
+                })?,
+            };
+            Ok(Dispatch::A11yClick(A11yClickOp {
+                query: p.query,
+                role: p.role,
+                pid: p.pid,
+                button,
+                match_index: p.match_index.unwrap_or(0),
+                require_unique: p.require_unique,
+                max_nodes: p.max_nodes,
                 dry_run: p.dry_run,
             }))
         }
@@ -1358,6 +1596,22 @@ fn build_optional_region(
             message: "region requires all of x, y, w, h (or none of them)".into(),
         }),
     }
+}
+
+/// `active_window` scopes to the focused window; an explicit region picks a
+/// fixed rectangle. Both at once is contradictory — reject rather than guess.
+fn reject_region_with_active_window(
+    tool: &str,
+    has_region: bool,
+    active_window: bool,
+) -> Result<(), DispatchError> {
+    if has_region && active_window {
+        return Err(DispatchError::InvalidArgs {
+            tool: tool.to_string(),
+            message: "active_window cannot be combined with an explicit x/y/w/h region".into(),
+        });
+    }
+    Ok(())
 }
 
 fn parse_combo(tool: &str, s: &str) -> Result<KeyCombo, DispatchError> {
@@ -1490,7 +1744,7 @@ mod tests {
     fn registry_count() {
         // Lock the surface so additions are deliberate. Update this number
         // intentionally when adding/removing tools.
-        assert_eq!(registry().len(), 48);
+        assert_eq!(registry().len(), 52);
     }
 
     #[test]
@@ -1715,5 +1969,184 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, DispatchError::InvalidArgs { .. }));
+    }
+
+    #[test]
+    fn a11y_tree_forwards_with_defaults() {
+        let d = dispatch("a11y_tree", serde_json::json!({})).unwrap();
+        match d {
+            Dispatch::Forward(Request::A11yTree { pid, max_nodes }) => {
+                assert_eq!(pid, None, "pid defaults to focused window (None)");
+                assert_eq!(max_nodes, None);
+            }
+            other => panic!("expected Forward(A11yTree), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a11y_find_forwards_query_and_role() {
+        let d = dispatch(
+            "a11y_find",
+            serde_json::json!({"query": "Submit", "role": "push button", "pid": 4321}),
+        )
+        .unwrap();
+        match d {
+            Dispatch::Forward(Request::A11yFind { pid, query, role, .. }) => {
+                assert_eq!(pid, Some(4321));
+                assert_eq!(query, "Submit");
+                assert_eq!(role.as_deref(), Some("push button"));
+            }
+            other => panic!("expected Forward(A11yFind), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a11y_click_defaults_to_dry_run() {
+        let d = dispatch("a11y_click", serde_json::json!({"query": "OK"})).unwrap();
+        match d {
+            Dispatch::A11yClick(op) => {
+                assert!(op.dry_run, "a11y_click MUST default to dry_run=true");
+                assert_eq!(op.match_index, 0);
+                assert!(op.require_unique);
+                assert!(matches!(op.button, MouseButton::Left));
+            }
+            other => panic!("expected A11yClick, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a11y_click_rejects_empty_query() {
+        let err = dispatch("a11y_click", serde_json::json!({"query": "  "})).unwrap_err();
+        assert!(matches!(err, DispatchError::InvalidArgs { .. }));
+    }
+
+    #[test]
+    fn a11y_click_rejects_bad_button() {
+        let err = dispatch("a11y_click", serde_json::json!({"query": "OK", "button": "nope"}))
+            .unwrap_err();
+        assert!(matches!(err, DispatchError::InvalidArgs { .. }));
+    }
+
+    #[test]
+    fn a11y_read_tools_are_in_a11y_group_and_not_mutating() {
+        let reg = registry();
+        for name in ["a11y_tree", "a11y_find"] {
+            let t = reg.iter().find(|t| t.name == name).expect("a11y tool in registry");
+            assert_eq!(t.group, crate::capability::ToolGroup::A11y);
+            assert!(!t.mutating);
+        }
+        let click = reg.iter().find(|t| t.name == "a11y_click").unwrap();
+        assert_eq!(click.group, crate::capability::ToolGroup::Input, "a11y_click moves the mouse");
+        assert!(click.mutating);
+    }
+
+    #[test]
+    fn find_text_position_active_window_scopes_without_region() {
+        let d = dispatch(
+            "find_text_position",
+            serde_json::json!({"query": "Save", "active_window": true}),
+        )
+        .unwrap();
+        match d {
+            Dispatch::FindText(op) => {
+                assert!(op.active_window);
+                assert!(op.region.is_none(), "active_window leaves region unset");
+            }
+            other => panic!("expected FindText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn active_window_with_explicit_region_is_rejected() {
+        for tool in ["find_text_position", "click_text"] {
+            let err = dispatch(
+                tool,
+                serde_json::json!({
+                    "query": "Save", "active_window": true,
+                    "x": 0, "y": 0, "w": 100u32, "h": 100u32,
+                }),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, DispatchError::InvalidArgs { .. }),
+                "{tool} must reject active_window + explicit region"
+            );
+        }
+    }
+
+    #[test]
+    fn click_text_active_window_parses() {
+        let d = dispatch(
+            "click_text",
+            serde_json::json!({"query": "OK", "active_window": true}),
+        )
+        .unwrap();
+        match d {
+            Dispatch::ClickText(op) => assert!(op.active_window),
+            other => panic!("expected ClickText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ocr_screen_active_window_selects_active_variant() {
+        let plain = dispatch("ocr_screen", serde_json::json!({})).unwrap();
+        assert!(matches!(plain, Dispatch::Ocr(OcrOp::Screen { .. })));
+        let active = dispatch("ocr_screen", serde_json::json!({"active_window": true})).unwrap();
+        assert!(matches!(active, Dispatch::Ocr(OcrOp::ActiveWindow { .. })));
+    }
+
+    #[test]
+    fn default_profile_excludes_a11y_tools() {
+        let p = crate::capability::Profile::default_safe();
+        for name in ["a11y_tree", "a11y_find", "a11y_click"] {
+            let group = registry().iter().find(|t| t.name == name).unwrap().group;
+            assert!(!p.allows(name, group), "default profile must NOT permit `{name}`");
+        }
+    }
+
+    #[test]
+    fn run_bind_forwards_parsed_combo() {
+        let d = dispatch("run_bind", serde_json::json!({"combo": "super+1"})).unwrap();
+        match d {
+            Dispatch::Forward(Request::RunBind { combo, submap, dry_run }) => {
+                assert_eq!(combo.key, "1");
+                assert!(dry_run, "run_bind MUST default to dry_run=true");
+                assert_eq!(submap, None);
+            }
+            other => panic!("expected Forward(RunBind), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_bind_apply_path_carries_submap() {
+        let d = dispatch(
+            "run_bind",
+            serde_json::json!({"combo": "super+h", "submap": "resize", "dry_run": false}),
+        )
+        .unwrap();
+        match d {
+            Dispatch::Forward(Request::RunBind { submap, dry_run, .. }) => {
+                assert_eq!(submap.as_deref(), Some("resize"));
+                assert!(!dry_run);
+            }
+            other => panic!("expected Forward(RunBind), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_bind_rejects_bad_combo() {
+        let err = dispatch("run_bind", serde_json::json!({"combo": "super++"})).unwrap_err();
+        assert!(matches!(err, DispatchError::InvalidArgs { .. }));
+    }
+
+    #[test]
+    fn run_bind_is_in_binds_group_and_not_default() {
+        let t = registry().iter().find(|t| t.name == "run_bind").cloned().unwrap();
+        assert_eq!(t.group, crate::capability::ToolGroup::Binds);
+        assert!(t.mutating);
+        assert!(
+            !crate::capability::Profile::default_safe().allows("run_bind", t.group),
+            "run_bind must NOT be in the default profile (it can exec)"
+        );
     }
 }

@@ -51,6 +51,14 @@ pub enum ToolGroup {
     /// Screen capture + OCR. Mildly privacy-sensitive (screenshots can
     /// contain private content), so opt-in only. NOT in the default profile.
     Vision,
+    /// Accessibility (AT-SPI) tree reading: structured UI content — labels,
+    /// roles, and field text — without pixels. Privacy-sensitive (a field's
+    /// text may be a secret), so opt-in only. NOT in the default profile.
+    A11y,
+    /// Execute the user's configured keybinds by chord. Bounded to actions the
+    /// user already bound — but those can include `exec`, so it is as powerful
+    /// as the keymap. Opt-in only; NOT in the default profile.
+    Binds,
 }
 
 impl ToolGroup {
@@ -66,6 +74,8 @@ impl ToolGroup {
             ToolGroup::Rules => "rules",
             ToolGroup::Input => "input",
             ToolGroup::Vision => "vision",
+            ToolGroup::A11y => "a11y",
+            ToolGroup::Binds => "binds",
         }
     }
 }
@@ -115,6 +125,8 @@ impl Profile {
             ToolGroup::Rules,
             ToolGroup::Input,
             ToolGroup::Vision,
+            ToolGroup::A11y,
+            ToolGroup::Binds,
         ] {
             allow.insert(g);
         }
