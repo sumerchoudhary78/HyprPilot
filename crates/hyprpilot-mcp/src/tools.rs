@@ -659,6 +659,22 @@ pub struct A11yClickArgs {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct RunBindArgs {
+    /// Key chord to run, e.g. `super+1`, `super+return`, `super+shift+e`.
+    /// Same grammar as `input_keys`. Discover available chords with
+    /// `query_binds`.
+    pub combo: String,
+    /// Submap the bind lives in (default: the global submap). Only needed for
+    /// chords defined inside a Hyprland `submap`.
+    #[serde(default)]
+    pub submap: Option<String>,
+    /// When true (default), resolve the bind and report the action it would
+    /// dispatch without running it. Pass `false` to execute.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SnapshotMutArgs {
     /// Snapshot name. Allowed chars: `[A-Za-z0-9_.-]+`, must not start with `.`,
     /// max 128 chars.
@@ -1140,6 +1156,23 @@ pub fn registry() -> Vec<ToolDef> {
              capability group (NOT in the default profile) and the daemon's \
              HYPRPILOT_DANGEROUS_INPUT_OK=1 gate.",
         ),
+        // ---- Keymap (group: binds) — NOT in default profile -----------------
+        def::<RunBindArgs>(
+            "run_bind",
+            Binds,
+            true,
+            "Run the user's keybind for a chord (e.g. `super+1`, \
+             `super+return`) by dispatching the action it is bound to directly \
+             in the compositor — the way a human just presses the chord. \
+             Unlike `input_keys` this needs no key synthesis (no ydotool, no \
+             focus/timing fragility) and does NOT require the \
+             HYPRPILOT_DANGEROUS_INPUT_OK gate, because it is bounded to \
+             actions the user already configured. Discover chords with \
+             `query_binds`. dry_run defaults to true: returns the action that \
+             would be dispatched. NOTE: a bound action can be `exec`, so this \
+             can launch whatever the user bound; the `binds` capability group \
+             is NOT in the default profile.",
+        ),
     ]
 }
 
@@ -1474,6 +1507,17 @@ pub fn dispatch(name: &str, args: Value) -> Result<Dispatch, DispatchError> {
             }))
         }
 
+        // ---- keymap --------------------------------------------------------
+        "run_bind" => {
+            let p: RunBindArgs = parse_args(name, args)?;
+            let combo = parse_combo(name, &p.combo)?;
+            Ok(Dispatch::Forward(Request::RunBind {
+                combo,
+                submap: p.submap,
+                dry_run: p.dry_run,
+            }))
+        }
+
         // ---- accessibility -------------------------------------------------
         "a11y_tree" => {
             let p: A11yTreeArgs = parse_args(name, args)?;
@@ -1695,7 +1739,7 @@ mod tests {
     fn registry_count() {
         // Lock the surface so additions are deliberate. Update this number
         // intentionally when adding/removing tools.
-        assert_eq!(registry().len(), 51);
+        assert_eq!(registry().len(), 52);
     }
 
     #[test]
@@ -2053,5 +2097,51 @@ mod tests {
             let group = registry().iter().find(|t| t.name == name).unwrap().group;
             assert!(!p.allows(name, group), "default profile must NOT permit `{name}`");
         }
+    }
+
+    #[test]
+    fn run_bind_forwards_parsed_combo() {
+        let d = dispatch("run_bind", serde_json::json!({"combo": "super+1"})).unwrap();
+        match d {
+            Dispatch::Forward(Request::RunBind { combo, submap, dry_run }) => {
+                assert_eq!(combo.key, "1");
+                assert!(dry_run, "run_bind MUST default to dry_run=true");
+                assert_eq!(submap, None);
+            }
+            other => panic!("expected Forward(RunBind), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_bind_apply_path_carries_submap() {
+        let d = dispatch(
+            "run_bind",
+            serde_json::json!({"combo": "super+h", "submap": "resize", "dry_run": false}),
+        )
+        .unwrap();
+        match d {
+            Dispatch::Forward(Request::RunBind { submap, dry_run, .. }) => {
+                assert_eq!(submap.as_deref(), Some("resize"));
+                assert!(!dry_run);
+            }
+            other => panic!("expected Forward(RunBind), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_bind_rejects_bad_combo() {
+        let err = dispatch("run_bind", serde_json::json!({"combo": "super++"})).unwrap_err();
+        assert!(matches!(err, DispatchError::InvalidArgs { .. }));
+    }
+
+    #[test]
+    fn run_bind_is_in_binds_group_and_not_default() {
+        let t = registry().iter().find(|t| t.name == "run_bind").cloned().unwrap();
+        assert_eq!(t.group, crate::capability::ToolGroup::Binds);
+        assert!(t.mutating);
+        assert!(
+            !crate::capability::Profile::default_safe().allows("run_bind", t.group),
+            "run_bind must NOT be in the default profile (it can exec)"
+        );
     }
 }

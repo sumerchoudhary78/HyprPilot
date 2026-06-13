@@ -119,6 +119,15 @@ pub enum Request {
         role: Option<String>,
         max_nodes: Option<usize>,
     },
+
+    /// Look up the user's keybind for `combo` (in `submap`, default global)
+    /// and dispatch its action in the compositor — driving the user's keymap
+    /// without synthesising a keypress. Bounded to configured binds.
+    ///
+    /// Carries `dry_run` (unlike other mutating ops, which gate dry-run in the
+    /// MCP layer) because the preview must resolve the bind, which only the
+    /// daemon can do.
+    RunBind { combo: KeyCombo, submap: Option<String>, dry_run: bool },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +189,8 @@ pub mod codes {
     pub const A11Y_NO_APP: &str = "a11y_no_app";
     /// An AT-SPI D-Bus call failed mid-walk.
     pub const A11Y_FAILED: &str = "a11y_failed";
+    /// No configured keybind matched the requested chord (`run_bind`).
+    pub const BIND_NOT_FOUND: &str = "bind_not_found";
     pub const INTERNAL: &str = "internal";
 }
 

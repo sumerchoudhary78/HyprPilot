@@ -361,6 +361,11 @@ async fn handle_request(state: &State, req: Request) -> Response {
         Request::A11yFind { pid, query, role, max_nodes } => {
             a11y_find(state, pid, query, role, max_nodes).await
         }
+
+        // ---- keymap --------------------------------------------------------
+        Request::RunBind { combo, submap, dry_run } => {
+            run_bind(state, combo, submap, dry_run).await
+        }
     }
 }
 
@@ -546,6 +551,49 @@ async fn a11y_find(
             "elements": elements,
         })),
         Err(e) => a11y_error_response(state, e).await,
+    }
+}
+
+/// `run_bind`: resolve the user's keybind for `combo` and dispatch its action
+/// directly (no key synthesis). Reads binds from the world-model cache.
+async fn run_bind(
+    state: &State,
+    combo: KeyCombo,
+    submap: Option<String>,
+    dry_run: bool,
+) -> Response {
+    let submap = submap.unwrap_or_default();
+    let binds = match state.cache.binds().await {
+        Ok(b) => b,
+        Err(e) => return core_error(e),
+    };
+    let Some(bind) = crate::binds::resolve(&binds, &combo, &submap) else {
+        let scope = if submap.is_empty() {
+            String::new()
+        } else {
+            format!(" in submap `{submap}`")
+        };
+        return Response::err(
+            codes::BIND_NOT_FOUND,
+            format!("no keybind matches `{combo}`{scope}"),
+        );
+    };
+    let action = crate::binds::bind_action(bind);
+    if dry_run {
+        return Response::ok(serde_json::json!({
+            "dry_run": true,
+            "combo": combo.to_string(),
+            "dispatcher": bind.dispatcher.clone(),
+            "arg": bind.arg.clone(),
+            "would_dispatch": action,
+        }));
+    }
+    match state.hypr.dispatch(&action).await {
+        Ok(()) => Response::ok(serde_json::json!({
+            "ran": combo.to_string(),
+            "dispatched": action,
+        })),
+        Err(e) => core_error(e),
     }
 }
 
