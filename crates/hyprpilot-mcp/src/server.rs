@@ -218,17 +218,29 @@ impl Server {
                 self.preview_snapshot_restore(id, name).await
             }
             Dispatch::Capture(op) => handle_capture(id, op).await,
-            Dispatch::Ocr(op) => handle_ocr(id, op).await,
-            Dispatch::FindText(op) => handle_find_text(id, op).await,
+            Dispatch::Ocr(op) => self.handle_ocr(id, op).await,
+            Dispatch::FindText(op) => self.handle_find_text(id, op).await,
             Dispatch::ClickText(op) => self.handle_click_text(id, op).await,
             Dispatch::A11yClick(op) => self.handle_a11y_click(id, op).await,
         }
     }
 
     async fn handle_click_text(&mut self, id: Value, op: ClickTextOp) -> JsonRpcResponse {
+        // Effective scan region: the focused window (from the cache) when
+        // `active_window` is set, otherwise the explicit region (or full
+        // screen). dispatch() already rejected setting both.
+        let region = if op.active_window {
+            match self.resolve_active_window_region(&id).await {
+                Ok(r) => Some(r),
+                Err(resp) => return resp,
+            }
+        } else {
+            op.region
+        };
+
         // Stage 1: vision (daemon-bypass — capture + OCR run locally).
         let matches = match scan_for_matches(
-            op.region.as_ref().copied(),
+            region,
             &op.query,
             op.case_sensitive,
             op.min_confidence,
@@ -271,7 +283,7 @@ impl Server {
         // monitor's scale. Query monitors so we can map back.
         let scale = match self.call_daemon(Request::QueryMonitors).await {
             Ok(v) => match serde_json::from_value::<Vec<Monitor>>(v) {
-                Ok(ms) => pick_scale(&ms, op.region.as_ref()),
+                Ok(ms) => pick_scale(&ms, region.as_ref()),
                 Err(e) => {
                     return tool_error(
                         id,
@@ -291,7 +303,7 @@ impl Server {
         let (cx_img, cy_img) = chosen.bbox.center();
         let cx_logical = ((cx_img as f64) / scale).round() as i32;
         let cy_logical = ((cy_img as f64) / scale).round() as i32;
-        let (cx, cy) = match op.region {
+        let (cx, cy) = match region {
             Some(r) => (cx_logical + r.x, cy_logical + r.y),
             None => (cx_logical, cy_logical),
         };
@@ -587,9 +599,11 @@ async fn scan_for_matches(
     lang: &str,
 ) -> Result<Vec<TextMatch>, String> {
     let cap = GrimCapture::detect().map_err(|e| e.to_string())?;
+    // PPM (raw) not PNG: this image is piped straight into tesseract, never
+    // shown, so the lossless PNG encode is pure overhead.
     let bytes = match region {
-        Some(r) => cap.region(r, VisionImageFormat::Png).await,
-        None => cap.full(None, VisionImageFormat::Png).await,
+        Some(r) => cap.region(r, VisionImageFormat::Ppm).await,
+        None => cap.full(None, VisionImageFormat::Ppm).await,
     }
     .map_err(|e| e.to_string())?;
 
@@ -609,34 +623,82 @@ async fn scan_for_matches(
     Ok(matches)
 }
 
-async fn handle_find_text(id: Value, op: FindTextOp) -> JsonRpcResponse {
-    match scan_for_matches(
-        op.region,
-        &op.query,
-        op.case_sensitive,
-        op.min_confidence,
-        op.psm,
-        &op.lang,
-    )
-    .await
-    {
-        Ok(matches) => {
-            let body = serde_json::json!({
-                "query": op.query,
-                "match_count": matches.len(),
-                "matches": matches,
-            });
-            JsonRpcResponse::ok(
-                id,
-                CallToolResult {
-                    content: vec![Content::text(
-                        serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string()),
-                    )],
-                    is_error: false,
-                },
-            )
+impl Server {
+    async fn handle_find_text(&mut self, id: Value, op: FindTextOp) -> JsonRpcResponse {
+        let region = if op.active_window {
+            match self.resolve_active_window_region(&id).await {
+                Ok(r) => Some(r),
+                Err(resp) => return resp,
+            }
+        } else {
+            op.region
+        };
+        match scan_for_matches(
+            region,
+            &op.query,
+            op.case_sensitive,
+            op.min_confidence,
+            op.psm,
+            &op.lang,
+        )
+        .await
+        {
+            Ok(matches) => {
+                let body = serde_json::json!({
+                    "query": op.query,
+                    "match_count": matches.len(),
+                    "matches": matches,
+                });
+                JsonRpcResponse::ok(
+                    id,
+                    CallToolResult {
+                        content: vec![Content::text(
+                            serde_json::to_string_pretty(&body)
+                                .unwrap_or_else(|_| body.to_string()),
+                        )],
+                        is_error: false,
+                    },
+                )
+            }
+            Err(e) => tool_error(id, ErrorCode::ToolExecution, e),
         }
-        Err(e) => tool_error(id, ErrorCode::ToolExecution, e),
+    }
+
+    /// Resolve the focused window's rectangle (logical compositor coords) from
+    /// the daemon's world-model cache, for `active_window`-scoped vision.
+    async fn resolve_active_window_region(&mut self, id: &Value) -> Result<Region, JsonRpcResponse> {
+        let value = match self.call_daemon(Request::QueryActiveWindow).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.daemon = None;
+                let (code, message) = classify_daemon_error(&e);
+                return Err(tool_error(id.clone(), code, message));
+            }
+        };
+        let client: Option<Client> = serde_json::from_value(value).map_err(|e| {
+            tool_error(
+                id.clone(),
+                ErrorCode::ToolExecution,
+                format!("daemon returned malformed active window: {e}"),
+            )
+        })?;
+        let Some(c) = client else {
+            return Err(tool_error(
+                id.clone(),
+                ErrorCode::ToolExecution,
+                "no active window to scope to; focus a window or pass an explicit region"
+                    .to_string(),
+            ));
+        };
+        let (w, h) = (c.size[0], c.size[1]);
+        if w <= 0 || h <= 0 {
+            return Err(tool_error(
+                id.clone(),
+                ErrorCode::ToolExecution,
+                format!("active window `{}` has no positive size ({w}x{h})", c.class),
+            ));
+        }
+        Ok(Region { x: c.at[0], y: c.at[1], w: w as u32, h: h as u32 })
     }
 }
 
@@ -867,37 +929,42 @@ async fn handle_capture(id: Value, op: CaptureOp) -> JsonRpcResponse {
 /// Run an OCR op: capture, then extract text. Returns a `text` content
 /// block. The OCR backend treats "no recognizable text" as `Ok("")` (not an
 /// error), so an empty string is a legitimate success result.
-async fn handle_ocr(id: Value, op: OcrOp) -> JsonRpcResponse {
-    let cap = match GrimCapture::detect() {
-        Ok(c) => c,
-        Err(e) => return tool_error(id, ErrorCode::ToolExecution, e.to_string()),
-    };
-    let (bytes_res, lang, psm) = match op {
-        OcrOp::Screen { lang, psm } => (
-            cap.full(None, hyprpilot_vision::ImageFormat::Png).await,
-            lang,
-            psm,
-        ),
-        OcrOp::Region { region, lang, psm } => (
-            cap.region(region, hyprpilot_vision::ImageFormat::Png).await,
-            lang,
-            psm,
-        ),
-    };
-    let bytes = match bytes_res {
-        Ok(b) => b,
-        Err(e) => return tool_error(id, ErrorCode::ToolExecution, e.to_string()),
-    };
-    let ocr = match TesseractOcr::detect() {
-        Ok(o) => o.with_lang(lang).with_psm(psm),
-        Err(e) => return tool_error(id, ErrorCode::ToolExecution, e.to_string()),
-    };
-    match ocr.extract_text(&bytes).await {
-        Ok(text) => JsonRpcResponse::ok(
-            id,
-            CallToolResult { content: vec![Content::text(text)], is_error: false },
-        ),
-        Err(e) => tool_error(id, ErrorCode::ToolExecution, e.to_string()),
+///
+/// Captures use PPM (raw): the bytes are piped to tesseract, never shown, so
+/// the PNG encode would be wasted work.
+impl Server {
+    async fn handle_ocr(&mut self, id: Value, op: OcrOp) -> JsonRpcResponse {
+        let (region, lang, psm) = match op {
+            OcrOp::Screen { lang, psm } => (None, lang, psm),
+            OcrOp::Region { region, lang, psm } => (Some(region), lang, psm),
+            OcrOp::ActiveWindow { lang, psm } => match self.resolve_active_window_region(&id).await {
+                Ok(r) => (Some(r), lang, psm),
+                Err(resp) => return resp,
+            },
+        };
+        let cap = match GrimCapture::detect() {
+            Ok(c) => c,
+            Err(e) => return tool_error(id, ErrorCode::ToolExecution, e.to_string()),
+        };
+        let bytes_res = match region {
+            Some(r) => cap.region(r, VisionImageFormat::Ppm).await,
+            None => cap.full(None, VisionImageFormat::Ppm).await,
+        };
+        let bytes = match bytes_res {
+            Ok(b) => b,
+            Err(e) => return tool_error(id, ErrorCode::ToolExecution, e.to_string()),
+        };
+        let ocr = match TesseractOcr::detect() {
+            Ok(o) => o.with_lang(lang).with_psm(psm),
+            Err(e) => return tool_error(id, ErrorCode::ToolExecution, e.to_string()),
+        };
+        match ocr.extract_text(&bytes).await {
+            Ok(text) => JsonRpcResponse::ok(
+                id,
+                CallToolResult { content: vec![Content::text(text)], is_error: false },
+            ),
+            Err(e) => tool_error(id, ErrorCode::ToolExecution, e.to_string()),
+        }
     }
 }
 

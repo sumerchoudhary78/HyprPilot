@@ -117,13 +117,18 @@ pub enum OcrOp {
     Screen { lang: String, psm: Psm },
     /// OCR a specific region.
     Region { region: Region, lang: String, psm: Psm },
+    /// OCR the focused window's rectangle (resolved server-side from the
+    /// world-model cache). Far cheaper than a full-screen capture.
+    ActiveWindow { lang: String, psm: Psm },
 }
 
-/// What to scan for. `region=None` means full screen.
+/// What to scan for. `region=None` means full screen unless `active_window`
+/// is set, in which case the server scopes to the focused window's rectangle.
 #[derive(Debug)]
 pub struct FindTextOp {
     pub query: String,
     pub region: Option<Region>,
+    pub active_window: bool,
     pub case_sensitive: bool,
     pub min_confidence: i32,
     pub psm: Psm,
@@ -136,6 +141,7 @@ pub struct FindTextOp {
 pub struct ClickTextOp {
     pub query: String,
     pub region: Option<Region>,
+    pub active_window: bool,
     pub case_sensitive: bool,
     pub min_confidence: i32,
     pub psm: Psm,
@@ -468,6 +474,10 @@ pub struct OcrScreenArgs {
     /// default), 7 (single line), 11 (sparse text).
     #[serde(default = "default_psm")]
     pub psm: u8,
+    /// Scope OCR to the focused window's rectangle instead of the whole
+    /// compositor. Much cheaper (one window, not a 4K frame). Default false.
+    #[serde(default)]
+    pub active_window: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -539,6 +549,11 @@ pub struct FindTextPositionArgs {
     /// Tesseract language code (e.g. `eng`, `eng+fra`). Default `eng`.
     #[serde(default = "default_lang")]
     pub lang: String,
+    /// Scope the scan to the focused window's rectangle instead of the whole
+    /// screen (cheaper, fewer false matches). Cannot be combined with an
+    /// explicit x/y/w/h region. Default false.
+    #[serde(default)]
+    pub active_window: bool,
 }
 
 /// Inputs to the composite `click_text` tool. Superset of
@@ -562,6 +577,10 @@ pub struct ClickTextArgs {
     pub psm: u8,
     #[serde(default = "default_lang")]
     pub lang: String,
+    /// Scope the scan to the focused window's rectangle instead of the whole
+    /// screen. Cannot be combined with an explicit x/y/w/h region. Default false.
+    #[serde(default)]
+    pub active_window: bool,
     /// `left` (default), `right`, `middle`, `x1`/`back`, `x2`/`forward`.
     #[serde(default)]
     pub button: Option<String>,
@@ -1381,7 +1400,11 @@ pub fn dispatch(name: &str, args: Value) -> Result<Dispatch, DispatchError> {
         "ocr_screen" => {
             let p: OcrScreenArgs = parse_args(name, args)?;
             let psm = parse_psm(name, p.psm)?;
-            Ok(Dispatch::Ocr(OcrOp::Screen { lang: p.lang, psm }))
+            Ok(Dispatch::Ocr(if p.active_window {
+                OcrOp::ActiveWindow { lang: p.lang, psm }
+            } else {
+                OcrOp::Screen { lang: p.lang, psm }
+            }))
         }
         "ocr_region" => {
             let p: OcrRegionArgs = parse_args(name, args)?;
@@ -1403,10 +1426,12 @@ pub fn dispatch(name: &str, args: Value) -> Result<Dispatch, DispatchError> {
                 });
             }
             let region = build_optional_region(name, p.x, p.y, p.w, p.h)?;
+            reject_region_with_active_window(name, region.is_some(), p.active_window)?;
             let psm = parse_psm(name, p.psm)?;
             Ok(Dispatch::FindText(FindTextOp {
                 query: p.query,
                 region,
+                active_window: p.active_window,
                 case_sensitive: p.case_sensitive,
                 min_confidence: p.min_confidence,
                 psm,
@@ -1423,6 +1448,7 @@ pub fn dispatch(name: &str, args: Value) -> Result<Dispatch, DispatchError> {
                 });
             }
             let region = build_optional_region(name, p.x, p.y, p.w, p.h)?;
+            reject_region_with_active_window(name, region.is_some(), p.active_window)?;
             let psm = parse_psm(name, p.psm)?;
             let button = match p.button.as_deref() {
                 None => MouseButton::Left,
@@ -1436,6 +1462,7 @@ pub fn dispatch(name: &str, args: Value) -> Result<Dispatch, DispatchError> {
             Ok(Dispatch::ClickText(ClickTextOp {
                 query: p.query,
                 region,
+                active_window: p.active_window,
                 case_sensitive: p.case_sensitive,
                 min_confidence: p.min_confidence,
                 psm,
@@ -1520,6 +1547,22 @@ fn build_optional_region(
             message: "region requires all of x, y, w, h (or none of them)".into(),
         }),
     }
+}
+
+/// `active_window` scopes to the focused window; an explicit region picks a
+/// fixed rectangle. Both at once is contradictory — reject rather than guess.
+fn reject_region_with_active_window(
+    tool: &str,
+    has_region: bool,
+    active_window: bool,
+) -> Result<(), DispatchError> {
+    if has_region && active_window {
+        return Err(DispatchError::InvalidArgs {
+            tool: tool.to_string(),
+            message: "active_window cannot be combined with an explicit x/y/w/h region".into(),
+        });
+    }
+    Ok(())
 }
 
 fn parse_combo(tool: &str, s: &str) -> Result<KeyCombo, DispatchError> {
@@ -1946,6 +1989,61 @@ mod tests {
         let click = reg.iter().find(|t| t.name == "a11y_click").unwrap();
         assert_eq!(click.group, crate::capability::ToolGroup::Input, "a11y_click moves the mouse");
         assert!(click.mutating);
+    }
+
+    #[test]
+    fn find_text_position_active_window_scopes_without_region() {
+        let d = dispatch(
+            "find_text_position",
+            serde_json::json!({"query": "Save", "active_window": true}),
+        )
+        .unwrap();
+        match d {
+            Dispatch::FindText(op) => {
+                assert!(op.active_window);
+                assert!(op.region.is_none(), "active_window leaves region unset");
+            }
+            other => panic!("expected FindText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn active_window_with_explicit_region_is_rejected() {
+        for tool in ["find_text_position", "click_text"] {
+            let err = dispatch(
+                tool,
+                serde_json::json!({
+                    "query": "Save", "active_window": true,
+                    "x": 0, "y": 0, "w": 100u32, "h": 100u32,
+                }),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, DispatchError::InvalidArgs { .. }),
+                "{tool} must reject active_window + explicit region"
+            );
+        }
+    }
+
+    #[test]
+    fn click_text_active_window_parses() {
+        let d = dispatch(
+            "click_text",
+            serde_json::json!({"query": "OK", "active_window": true}),
+        )
+        .unwrap();
+        match d {
+            Dispatch::ClickText(op) => assert!(op.active_window),
+            other => panic!("expected ClickText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ocr_screen_active_window_selects_active_variant() {
+        let plain = dispatch("ocr_screen", serde_json::json!({})).unwrap();
+        assert!(matches!(plain, Dispatch::Ocr(OcrOp::Screen { .. })));
+        let active = dispatch("ocr_screen", serde_json::json!({"active_window": true})).unwrap();
+        assert!(matches!(active, Dispatch::Ocr(OcrOp::ActiveWindow { .. })));
     }
 
     #[test]
