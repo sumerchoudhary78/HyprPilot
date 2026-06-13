@@ -617,8 +617,10 @@ pub struct A11yFindArgs {
     /// text (case-insensitive). Empty matches on `role` alone.
     #[serde(default)]
     pub query: String,
-    /// Restrict to this AT-SPI role, e.g. `push button`, `entry`, `check box`,
-    /// `menu item`. Case-insensitive, exact role match.
+    /// Restrict to this AT-SPI role. Role names vary by toolkit — GTK reports
+    /// `button`, Qt may report `push button`; other examples: `entry`,
+    /// `toggle button`, `check box`, `menu item`, `label`, `text`.
+    /// Case-insensitive, exact match. Omit if unsure and match by name.
     #[serde(default)]
     pub role: Option<String>,
     /// Process id of the app to search. Omit to use the focused window.
@@ -633,7 +635,9 @@ pub struct A11yFindArgs {
 pub struct A11yClickArgs {
     /// Substring matched against the element's accessible name or inline text.
     pub query: String,
-    /// Restrict to this AT-SPI role (e.g. `push button`). Case-insensitive.
+    /// Restrict to this AT-SPI role (GTK: `button`; Qt may use `push button`).
+    /// Useful to disambiguate — a control often appears as both a `button` and
+    /// a nested `label` of the same name. Case-insensitive.
     #[serde(default)]
     pub role: Option<String>,
     /// Process id of the app. Omit to target the focused window's app.
@@ -1137,7 +1141,8 @@ pub fn registry() -> Vec<ToolDef> {
             A11y,
             false,
             "Find accessibility elements whose name or text matches `query` \
-             (and, optionally, whose role equals `role`, e.g. `push button`). \
+             (and, optionally, whose role equals `role` — GTK reports \
+             `button`, Qt may report `push button`; omit if unsure). \
              Returns matches with window-relative bounding boxes. The \
              structured, OCR-free analogue of `find_text_position`, and the \
              first half of a click-by-label flow. `pid` defaults to the \

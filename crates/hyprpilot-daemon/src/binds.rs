@@ -20,11 +20,25 @@ fn combo_mod_set(combo: &KeyCombo) -> BTreeSet<String> {
 
 /// Does `bind` fire for `combo` in submap `submap`?
 ///
+/// `submap`:
+/// - `Some(name)` matches that submap exactly.
+/// - `None` means "the default submap". Hyprland reports the default as `""`
+///   on a vanilla config but as `"global"` on others (e.g. caelestia, and
+///   some 0.5x builds), so both are accepted — otherwise `run_bind` with no
+///   submap would silently match nothing on those setups.
+///
 /// Keyboard binds only (mouse binds excluded). Modifiers are compared as
 /// sets (order-independent); the key is compared case-insensitively because
 /// Hyprland's reported key case varies (`T` vs `t`).
-pub fn bind_matches(bind: &Bind, combo: &KeyCombo, submap: &str) -> bool {
-    if bind.mouse || bind.submap != submap || !bind.key.eq_ignore_ascii_case(&combo.key) {
+pub fn bind_matches(bind: &Bind, combo: &KeyCombo, submap: Option<&str>) -> bool {
+    if bind.mouse {
+        return false;
+    }
+    let submap_ok = match submap {
+        Some(s) => bind.submap == s,
+        None => bind.submap.is_empty() || bind.submap == "global",
+    };
+    if !submap_ok || !bind.key.eq_ignore_ascii_case(&combo.key) {
         return false;
     }
     let bind_mods: BTreeSet<String> = bind.mods.iter().cloned().collect();
@@ -32,8 +46,9 @@ pub fn bind_matches(bind: &Bind, combo: &KeyCombo, submap: &str) -> bool {
 }
 
 /// First bind that fires for `combo` in `submap` (Hyprland resolves a chord to
-/// one action per submap; first-match mirrors that).
-pub fn resolve<'a>(binds: &'a [Bind], combo: &KeyCombo, submap: &str) -> Option<&'a Bind> {
+/// one action per submap; first-match mirrors that). `None` submap matches the
+/// default submap (`""` or `"global"`).
+pub fn resolve<'a>(binds: &'a [Bind], combo: &KeyCombo, submap: Option<&str>) -> Option<&'a Bind> {
     binds.iter().find(|b| bind_matches(b, combo, submap))
 }
 
@@ -71,7 +86,7 @@ mod tests {
     #[test]
     fn matches_simple_chord() {
         let b = bind(&["SUPER"], "1", "workspace", "1", "", false);
-        assert!(bind_matches(&b, &combo("super+1"), ""));
+        assert!(bind_matches(&b, &combo("super+1"), None));
         assert_eq!(bind_action(&b), "workspace 1");
     }
 
@@ -79,33 +94,43 @@ mod tests {
     fn modifiers_compared_as_set_not_order() {
         // decode_mods order is SHIFT, CTRL; combo order is by BTreeSet.
         let b = bind(&["SHIFT", "CTRL"], "t", "exec", "kitty", "", false);
-        assert!(bind_matches(&b, &combo("ctrl+shift+t"), ""));
+        assert!(bind_matches(&b, &combo("ctrl+shift+t"), None));
     }
 
     #[test]
     fn key_match_is_case_insensitive() {
         let b = bind(&["SUPER"], "T", "exec", "kitty", "", false);
-        assert!(bind_matches(&b, &combo("super+t"), ""), "Hyprland may report `T`");
+        assert!(bind_matches(&b, &combo("super+t"), None), "Hyprland may report `T`");
     }
 
     #[test]
     fn modifier_mismatch_rejected() {
         let b = bind(&["SUPER"], "1", "workspace", "1", "", false);
-        assert!(!bind_matches(&b, &combo("ctrl+1"), ""));
-        assert!(!bind_matches(&b, &combo("1"), ""), "no-modifier combo must not match");
+        assert!(!bind_matches(&b, &combo("ctrl+1"), None));
+        assert!(!bind_matches(&b, &combo("1"), None), "no-modifier combo must not match");
     }
 
     #[test]
     fn mouse_binds_excluded() {
         let b = bind(&["SUPER"], "mouse:272", "movewindow", "", "", true);
-        assert!(!bind_matches(&b, &combo("super+mouse:272"), ""));
+        assert!(!bind_matches(&b, &combo("super+mouse:272"), None));
     }
 
     #[test]
     fn submap_must_match() {
         let b = bind(&["SUPER"], "h", "movewindow", "l", "resize", false);
-        assert!(!bind_matches(&b, &combo("super+h"), ""), "global lookup must not hit a submap bind");
-        assert!(bind_matches(&b, &combo("super+h"), "resize"));
+        assert!(!bind_matches(&b, &combo("super+h"), None), "default lookup must not hit a submap bind");
+        assert!(bind_matches(&b, &combo("super+h"), Some("resize")));
+    }
+
+    #[test]
+    fn default_submap_matches_global_named_submap() {
+        // Caelestia / some Hyprland builds report the default submap as
+        // "global" rather than "". A `None` (unspecified) submap must still
+        // match it, or run_bind finds nothing on those setups.
+        let b = bind(&["SUPER"], "2", "exec", "wsaction workspace 2", "global", false);
+        assert!(bind_matches(&b, &combo("super+2"), None), "None must match the `global` submap");
+        assert!(bind_matches(&b, &combo("super+2"), Some("global")));
     }
 
     #[test]
@@ -114,8 +139,8 @@ mod tests {
             bind(&["SUPER"], "1", "workspace", "1", "", false),
             bind(&["SUPER"], "2", "workspace", "2", "", false),
         ];
-        assert_eq!(resolve(&binds, &combo("super+2"), "").unwrap().arg, "2");
-        assert!(resolve(&binds, &combo("super+9"), "").is_none());
+        assert_eq!(resolve(&binds, &combo("super+2"), None).unwrap().arg, "2");
+        assert!(resolve(&binds, &combo("super+9"), None).is_none());
     }
 
     #[test]

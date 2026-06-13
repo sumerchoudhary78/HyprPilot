@@ -562,16 +562,14 @@ async fn run_bind(
     submap: Option<String>,
     dry_run: bool,
 ) -> Response {
-    let submap = submap.unwrap_or_default();
     let binds = match state.cache.binds().await {
         Ok(b) => b,
         Err(e) => return core_error(e),
     };
-    let Some(bind) = crate::binds::resolve(&binds, &combo, &submap) else {
-        let scope = if submap.is_empty() {
-            String::new()
-        } else {
-            format!(" in submap `{submap}`")
+    let Some(bind) = crate::binds::resolve(&binds, &combo, submap.as_deref()) else {
+        let scope = match &submap {
+            Some(s) => format!(" in submap `{s}`"),
+            None => String::new(),
         };
         return Response::err(
             codes::BIND_NOT_FOUND,
