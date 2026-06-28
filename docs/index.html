@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- ===================================================================
+       GOOGLE SEARCH CONSOLE VERIFICATION
+       Replace content="..." with the token from Search Console
+       (Add property -> URL prefix -> https://sumerchoudhary78.github.io/HyprPilot/
+        -> HTML tag method), then commit + push.
+  ==================================================================== -->
+  <meta name="google-site-verification" content="REPLACE_WITH_YOUR_TOKEN" />
+
+  <title>HyprPilot — typed Rust IPC client, daemon, CLI &amp; MCP server for Hyprland</title>
+  <meta name="description" content="HyprPilot is a typed Rust client, long-running daemon with undo/snapshots, CLI, and MCP server for controlling the Hyprland Wayland compositor. Built to be driven by AI agents. Includes input synthesis and screen capture + OCR." />
+  <meta name="keywords" content="hyprland, rust, wayland, mcp server, ai agents, window manager automation, hyprland ipc, hyprpilot, model context protocol, claude, ocr, input synthesis" />
+  <link rel="canonical" href="https://sumerchoudhary78.github.io/HyprPilot/" />
+  <meta name="robots" content="index, follow" />
+  <meta name="author" content="Sumer Jakhar" />
+
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="HyprPilot — Rust + MCP control plane for Hyprland" />
+  <meta property="og:description" content="Typed Rust IPC client, daemon with undo/snapshots, CLI, and MCP server for Hyprland. Built to be driven by AI agents." />
+  <meta property="og:url" content="https://sumerchoudhary78.github.io/HyprPilot/" />
+  <meta name="twitter:card" content="summary" />
+  <meta name="twitter:title" content="HyprPilot — Rust + MCP control plane for Hyprland" />
+  <meta name="twitter:description" content="Typed Rust IPC client, daemon, CLI, and MCP server for Hyprland, built for AI agents." />
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareSourceCode",
+    "name": "HyprPilot",
+    "description": "Typed Rust IPC client, long-running daemon with undo and snapshots, CLI, and stdio MCP server for programmatic control of the Hyprland Wayland compositor. Built to be driven by AI agents.",
+    "codeRepository": "https://github.com/sumerchoudhary78/HyprPilot",
+    "programmingLanguage": "Rust",
+    "operatingSystem": "Linux (Wayland / Hyprland)",
+    "applicationCategory": "DeveloperApplication",
+    "softwareVersion": "1.0.0",
+    "author": { "@type": "Person", "name": "Sumer Jakhar" },
+    "keywords": "hyprland, rust, wayland, mcp, ai-agents, window-manager, ipc"
+  }
+  </script>
+
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body {
+      max-width: 760px; margin: 0 auto; padding: 2.5rem 1.25rem;
+      font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      color: #1a1a1a; background: #ffffff;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { color: #e6e6e6; background: #0d1117; }
+      a { color: #58a6ff; }
+      pre, code { background: #161b22 !important; }
+      .tag { border-color: #30363d; color: #8b949e; }
+      .card { background: #161b22; border-color: #30363d; }
+      footer { border-color: #30363d; }
+    }
+    h1 { font-size: 1.9rem; margin: 0 0 .25rem; }
+    h2 { font-size: 1.25rem; margin-top: 2rem; }
+    .tag { display: inline-block; font-size: .8rem; padding: .15rem .55rem; margin: .15rem .25rem .15rem 0;
+           border: 1px solid #d0d7de; border-radius: 999px; color: #57606a; }
+    a { color: #0969da; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    pre { background: #f6f8fa; padding: .9rem 1rem; border-radius: 8px; overflow-x: auto; }
+    code { background: #f6f8fa; padding: .15rem .35rem; border-radius: 4px; font-size: .9em; }
+    pre code { padding: 0; background: none; }
+    .cta { display: inline-block; margin: 1.25rem 0; padding: .7rem 1.2rem; background: #1f6feb;
+           color: #fff; border-radius: 8px; font-weight: 600; }
+    .cta:hover { text-decoration: none; opacity: .92; }
+    ul { padding-left: 1.2rem; }
+    footer { margin-top: 3rem; padding-top: 1.25rem; border-top: 1px solid #d0d7de; font-size: .9rem; color: #57606a; }
+  </style>
+</head>
+<body>
+  <h1>HyprPilot</h1>
+  <p><strong>Programmatic control of the Hyprland Wayland compositor — for AI agents and humans.</strong> A typed Rust IPC client, a long-running daemon with undo &amp; snapshots, a CLI, and a stdio MCP server, plus input synthesis and screen capture + OCR.</p>
+
+  <p>
+    <span class="tag">Rust</span><span class="tag">Hyprland</span><span class="tag">Wayland</span>
+    <span class="tag">MCP server</span><span class="tag">AI agents</span><span class="tag">CLI</span><span class="tag">v1.0.0</span>
+  </p>
+
+  <a class="cta" href="https://github.com/sumerchoudhary78/HyprPilot">View the source on GitHub →</a>
+
+  <h2>The crates</h2>
+  <ul>
+    <li><strong>hyprpilot-core</strong> — async Hyprland IPC client (control + event sockets), typed queries and dispatchers.</li>
+    <li><strong>hyprpilot-daemon</strong> — JSON-RPC over a Unix socket, with a reversible-operation undo stack and snapshots.</li>
+    <li><strong>hyprpilot-cli</strong> — the <code>hyprpilot</code> binary: window/workspace ops, queries, daemon control, undo.</li>
+    <li><strong>hyprpilot-mcp</strong> — stdio MCP server exposing Hyprland control to MCP hosts (Claude Desktop, Claude Code) as typed tools with capability profiles and a dry-run default.</li>
+    <li><strong>hyprpilot-input</strong> — input synthesis (typing, key chords, mouse) via <code>wtype</code>, <code>ydotool</code>, and <code>sendshortcut</code>.</li>
+    <li><strong>hyprpilot-vision</strong> — screen capture via <code>grim</code> and OCR via <code>tesseract</code>.</li>
+  </ul>
+
+  <h2>Install (Arch / AUR)</h2>
+  <pre><code>yay -S hyprpilot-mcp      # or: paru -S hyprpilot-mcp</code></pre>
+  <p>Installs the <code>hyprpilot</code>, <code>hyprpilot-daemon</code>, and <code>hyprpilot-mcp</code> binaries.</p>
+
+  <h2>Quick start</h2>
+  <pre><code>cargo build --release
+
+# Direct queries (no daemon needed)
+./target/release/hyprpilot query active-window
+./target/release/hyprpilot win cycle
+./target/release/hyprpilot ws switch 2
+
+# Daemon-backed undo
+./target/release/hyprpilot-daemon &amp;
+./target/release/hyprpilot --use-daemon ws send +1
+./target/release/hyprpilot undo</code></pre>
+
+  <h2>Why it exists</h2>
+  <p>AI agents that drive a desktop need a <em>typed, reversible, dry-run-safe</em> way to query and mutate window-manager state. HyprPilot gives them that for Hyprland, while staying useful as a plain CLI for humans. Full docs, MCP setup, and capability profiles are in the
+  <a href="https://github.com/sumerchoudhary78/HyprPilot#readme">README on GitHub</a>.</p>
+
+  <footer>
+    <p>Built by <a href="https://github.com/sumerchoudhary78">Sumer Jakhar</a> ·
+    Source &amp; issues: <a href="https://github.com/sumerchoudhary78/HyprPilot">github.com/sumerchoudhary78/HyprPilot</a></p>
+  </footer>
+</body>
+</html>
